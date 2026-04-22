@@ -55,7 +55,17 @@ signs:
       - "${artifact}"
 
 release:
-  draft: true
+  draft: false
 
 changelog:
-  disable: true
+  use: git
+  sort: asc
+  groups:
+    - title: "New features"
+      regexp: "^feat"
+    - title: "Bug fixes"
+      regexp: "^fix"
+    - title: "Documentation"
+      regexp: "^docs"
+    - title: "Other"
+      regexp: ".*"

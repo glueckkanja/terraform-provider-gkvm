@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +29,10 @@ type Client struct {
 	Token string
 	Repo  string // "owner/repo"
 	Ref   string // branch, tag, or commit SHA
+
+	// TestBaseURL and TestHTTPClient override the defaults; set only in tests.
+	TestBaseURL    string
+	TestHTTPClient *http.Client
 }
 
 // Entry represents a single item from the GitHub Contents API.
@@ -87,8 +92,22 @@ func (c *Client) FetchFile(rawURL string) ([]byte, error) {
 	return c.doRequest(rawURL, "application/octet-stream")
 }
 
+func (c *Client) apiBase() string {
+	if c.TestBaseURL != "" {
+		return c.TestBaseURL
+	}
+	return "https://api.github.com"
+}
+
+func (c *Client) getHTTPClient() *http.Client {
+	if c.TestHTTPClient != nil {
+		return c.TestHTTPClient
+	}
+	return httpClient
+}
+
 func (c *Client) buildURL(path string) string {
-	base := fmt.Sprintf("https://api.github.com/repos/%s/contents", c.Repo)
+	base := fmt.Sprintf("%s/repos/%s/contents", c.apiBase(), c.Repo)
 	if path != "" {
 		base += "/" + path
 	}
@@ -106,7 +125,7 @@ func isGitHubDomain(rawURL string) bool {
 }
 
 func (c *Client) doRequest(requestURL, accept string) ([]byte, error) {
-	req, err := http.NewRequest("GET", requestURL, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, requestURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
@@ -120,12 +139,12 @@ func (c *Client) doRequest(requestURL, accept string) ([]byte, error) {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := c.getHTTPClient().Do(req)
 	if err != nil {
 		// Sanitize error — do not leak token or full URL details in error messages.
 		return nil, fmt.Errorf("GitHub API request to %s failed: connection error (check network and token validity)", c.Repo)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Limit response body to prevent OOM from unexpectedly large payloads.
 	limitedReader := io.LimitReader(resp.Body, maxResponseBytes)
