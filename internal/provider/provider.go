@@ -58,7 +58,7 @@ func (p *GkvmProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp 
 			"github_token": schema.StringAttribute{
 				Optional:    true,
 				Sensitive:   true,
-				Description: "GitHub personal access token. Falls back to GITHUB_TOKEN / GH_TOKEN env vars, then 'gh auth token'. Only set explicitly if not using the gh CLI.",
+				Description: "GitHub personal access token. Falls back to GH_TOKEN, then GITHUB_TOKEN env vars, then 'gh auth token'. Only set explicitly if not using the gh CLI.",
 			},
 		},
 	}
@@ -71,16 +71,19 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		return
 	}
 
-	// Resolve GitHub token: config > GITHUB_TOKEN > GH_TOKEN > gh CLI
+	// Resolve GitHub token: config > GH_TOKEN > GITHUB_TOKEN > gh CLI
+	// GH_TOKEN is checked before GITHUB_TOKEN because GITHUB_TOKEN is automatically
+	// injected by GitHub Actions for every step (scoped to the calling repo only),
+	// whereas GH_TOKEN is an explicit user override — it should take precedence.
 	token := ""
 	if !config.GithubToken.IsNull() && !config.GithubToken.IsUnknown() {
 		token = config.GithubToken.ValueString()
 	}
 	if token == "" {
-		token = os.Getenv("GITHUB_TOKEN")
+		token = os.Getenv("GH_TOKEN")
 	}
 	if token == "" {
-		token = os.Getenv("GH_TOKEN")
+		token = os.Getenv("GITHUB_TOKEN")
 	}
 	if token == "" {
 		if out, err := exec.Command("gh", "auth", "token").Output(); err == nil {
