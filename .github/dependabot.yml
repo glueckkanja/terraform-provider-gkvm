@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Wait a week before proposing a new release so that freshly published
+    # (and potentially compromised) versions are not pulled in immediately.
+    cooldown:
+      default-days: 7
     groups:
       all-go-modules:
         patterns:
@@ -13,6 +17,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Wait a week before proposing a new release so that freshly published
+    # (and potentially compromised) versions are not pulled in immediately.
+    cooldown:
+      default-days: 7
     groups:
       all-actions:
         patterns:

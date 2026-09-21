@@ -1,0 +1,7 @@
+# Opt-in: inert until a developer runs `pre-commit install`.
+# Catches the same GitHub Actions security findings as CI, before the push.
+repos:
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.30.1
+    hooks:
+      - id: zizmor

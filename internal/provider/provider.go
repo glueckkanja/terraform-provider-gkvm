@@ -86,7 +86,7 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		token = os.Getenv("GITHUB_TOKEN")
 	}
 	if token == "" {
-		if out, err := exec.Command("gh", "auth", "token").Output(); err == nil {
+		if out, err := exec.CommandContext(ctx, "gh", "auth", "token").Output(); err == nil {
 			token = strings.TrimSpace(string(out))
 		}
 	}
