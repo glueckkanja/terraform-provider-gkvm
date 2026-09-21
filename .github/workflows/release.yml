@@ -5,31 +5,42 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
+# Deny everything at the workflow level; the job grants only what it needs.
+permissions: {}
 
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    permissions:
+      # Required to create the GitHub Release and upload the built artifacts.
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to full commit SHAs so a moved tag cannot silently
+      # change what runs here. Dependabot opens PRs when new versions ship.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          # GoReleaser publishes through the GitHub API using GITHUB_TOKEN
+          # below, so no git credentials need to be left on disk.
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: true
+          # Caching is disabled on the release path: a cache entry poisoned by
+          # a lower-privileged workflow run must not be able to influence the
+          # artifacts that get signed and published here.
+          cache: false
 
       - name: Import GPG key
-        uses: crazy-max/ghaction-import-gpg@v6
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
         id: import_gpg
         with:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.PASSPHRASE }}
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           args: release --clean
         env:
