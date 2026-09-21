@@ -8,12 +8,18 @@ on:
 # Deny everything at the workflow level; the job grants only what it needs.
 permissions: {}
 
+# Serialise releases per tag. Unlike CI, a release in flight must never be
+# cancelled: it would leave a tag partially published.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   goreleaser:
+    name: Build and publish release
     runs-on: ubuntu-latest
     permissions:
-      # Required to create the GitHub Release and upload the built artifacts.
-      contents: write
+      contents: write # Required to create the GitHub Release and upload assets.
     steps:
       # Actions are pinned to full commit SHAs so a moved tag cannot silently
       # change what runs here. Dependabot opens PRs when new versions ship.
