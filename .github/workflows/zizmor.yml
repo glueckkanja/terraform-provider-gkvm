@@ -29,9 +29,8 @@ jobs:
     name: GitHub Actions security audit
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      # Required to publish findings to the Code Scanning tab.
-      security-events: write
+      contents: read # Required to check out the workflows being audited.
+      security-events: write # Required to publish findings to Code Scanning.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

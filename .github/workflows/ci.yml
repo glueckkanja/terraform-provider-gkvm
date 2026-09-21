@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   lint:
+    name: Lint
     runs-on: ubuntu-latest
     permissions:
       # Read-only access to the repository contents is all checkout requires.
@@ -42,6 +43,7 @@ jobs:
           version: v2.13.2
 
   test:
+    name: Build and test
     runs-on: ubuntu-latest
     permissions:
       contents: read
