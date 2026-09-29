@@ -1,12 +1,12 @@
 ---
 page_title: "gkvm_monitoring_profiles Data Source - gkvm"
 description: |-
-  Fetches monitoring alert profiles from a directory of YAML files in the configured GitHub repository.
+  Fetches monitoring alert profiles from a directory of YAML files in the configured repository.
 ---
 
 # gkvm_monitoring_profiles (Data Source)
 
-Fetches monitoring alert profiles from a directory of YAML files in the configured GitHub repository. Each profile is returned as a JSON string containing `metric_alerts` and `log_alerts`. Use `jsondecode()` to consume them in Terraform.
+Fetches monitoring alert profiles from a directory of YAML files in the configured repository. Each profile is returned as a JSON string containing `metric_alerts` and `log_alerts`. Use `jsondecode()` to consume them in Terraform.
 
 ## Example Usage
 
@@ -14,7 +14,7 @@ Fetches monitoring alert profiles from a directory of YAML files in the configur
 
 ```hcl
 provider "gkvm" {
-  github_repo = "glueckkanja/gkvm-monitoring-defaults"
+  repository = "glueckkanja/gkvm-monitoring-defaults"
 }
 
 data "gkvm_monitoring_profiles" "defaults" {}

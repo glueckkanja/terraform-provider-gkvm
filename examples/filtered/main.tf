@@ -2,14 +2,14 @@ terraform {
   required_providers {
     gkvm = {
       source  = "glueckkanja/gkvm"
-      version = "~> 0.1"
+      version = "~> 0.2"
     }
   }
 }
 
 provider "gkvm" {
-  github_repo = "glueckkanja/gkvm-monitoring-defaults"
-  github_ref  = "v1.0.0"
+  repository = "glueckkanja/gkvm-monitoring-defaults"
+  ref        = "v1.0.0"
 }
 
 # Fetch only specific profiles from a custom directory path

@@ -2,15 +2,16 @@ terraform {
   required_providers {
     gkvm = {
       source  = "glueckkanja/gkvm"
-      version = "~> 0.1"
+      version = "~> 0.2"
     }
   }
 }
 
 provider "gkvm" {
-  github_repo = "glueckkanja/gkvm-monitoring-defaults"
-  # github_ref defaults to "main"
-  # github_token resolved automatically from GITHUB_TOKEN / GH_TOKEN / gh CLI
+  repository = "glueckkanja/gkvm-monitoring-defaults"
+  # platform defaults to "github", base_url to https://api.github.com
+  # ref defaults to "main"
+  # token resolved automatically from GKVM_TOKEN / GH_TOKEN / GITHUB_TOKEN / gh CLI
 }
 
 # Fetch all monitoring profiles from the default path ("defaults/")
