@@ -1,5 +1,68 @@
 # Changelog
 
+## [Unreleased] — Configurable endpoint and GitLab support
+
+### Overview
+
+The provider is no longer bound to GitHub.com. The API endpoint is
+configurable, which makes GitHub Enterprise Server and GitHub Enterprise Cloud
+with data residency reachable, and GitLab is supported as a second platform.
+
+Existing configurations keep working unchanged; the GitHub-only attribute
+names are deprecated, not removed.
+
+### Added
+
+- `base_url` — REST API endpoint of the deployment to read from. Defaults to
+  `https://api.github.com` or `https://gitlab.com/api/v4` depending on
+  `platform`, and falls back to the `GKVM_BASE_URL` environment variable.
+  A bare hostname is completed with the platform's API path (`/api/v3` for
+  GitHub Enterprise Server, `/api/v4` for GitLab), while an endpoint that
+  already carries a path is used verbatim. HTTPS is required.
+- `platform` — `github` (default) or `gitlab`.
+- GitLab backend: project paths with nested subgroups, tree listings paged
+  explicitly at 100 entries (the endpoint defaults to 20, which would silently
+  truncate a profile directory), and raw file reads through the Repository
+  Files API.
+- Platform-neutral `repository`, `ref` and `token` attributes.
+- `GKVM_TOKEN` environment variable, read by both platforms.
+- GitLab token resolution: `GITLAB_TOKEN`, then `CI_JOB_TOKEN`, then
+  `glab auth token`. A CI job token is sent as `JOB-TOKEN`, which is the only
+  header GitLab accepts it in.
+
+### Changed
+
+- Raw file content is read through the Contents API with the raw media type
+  instead of following the `download_url` from the directory listing. Every
+  request now stays on the configured endpoint: no `raw.githubusercontent.com`
+  (or an Enterprise deployment's equivalent) has to be reachable, and the token
+  is never sent to a second host.
+- The platform CLI fallback asks for the token of the host that `base_url`
+  resolves to (`gh auth token --hostname HOST`). Previously the CLI default
+  host was used, so a CLI logged into an Enterprise host handed out a token
+  that `api.github.com` then rejected with a misleading 401.
+- Error messages name the endpoint, the repository and the ref.
+
+### Fixed
+
+- Repository paths are validated segment by segment and reject relative path
+  elements. `..` consists of allowed characters, so the previous pattern
+  accepted a repository such as `../other-repo`.
+- Repository and file paths are percent-encoded when built into request URLs.
+
+### Deprecated
+
+| Attribute | Replacement |
+|-----------|-------------|
+| `github_repo` | `repository` |
+| `github_ref` | `ref` |
+| `github_token` | `token` |
+
+The old names still configure the provider and emit a deprecation warning.
+Setting both spellings of one value to different values is an error.
+
+---
+
 ## [0.1.0] — Initial Release
 
 ### Overview

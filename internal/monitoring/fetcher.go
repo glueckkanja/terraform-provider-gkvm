@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/glueckkanja/terraform-provider-gkvm/internal/github"
+	"github.com/glueckkanja/terraform-provider-gkvm/internal/source"
 	"gopkg.in/yaml.v3"
 )
 
 // ValidatePath checks that a profile directory path is safe before making requests.
 func ValidatePath(path string) error {
-	if path != "" && (strings.Contains(path, "..") || strings.HasPrefix(path, "/")) {
+	if err := source.ValidatePath(path); err != nil {
 		return fmt.Errorf("invalid profile_path %q: must not contain path traversal (..) or start with /", path)
 	}
 	return nil
@@ -19,7 +19,7 @@ func ValidatePath(path string) error {
 
 // FetchProfiles lists YAML files in the given directory and returns parsed profiles as JSON strings.
 // If path is empty, it defaults to "defaults".
-func FetchProfiles(client *github.Client, path string) (map[string]string, error) {
+func FetchProfiles(client source.Client, path string) (map[string]string, error) {
 	if err := ValidatePath(path); err != nil {
 		return nil, err
 	}
@@ -36,17 +36,18 @@ func FetchProfiles(client *github.Client, path string) (map[string]string, error
 	result := make(map[string]string)
 
 	for _, entry := range entries {
-		if entry.Type != "file" || !strings.HasSuffix(entry.Name, ".yaml") {
+		if entry.IsDir || !strings.HasSuffix(entry.Name, ".yaml") {
 			continue
 		}
 
 		name := strings.TrimSuffix(entry.Name, ".yaml")
 
-		if entry.DownloadURL == "" {
-			return nil, fmt.Errorf("profile %s has no download_url — file may be too large or binary", name)
+		filePath := entry.Path
+		if filePath == "" {
+			filePath = path + "/" + entry.Name
 		}
 
-		content, err := client.FetchFile(entry.DownloadURL)
+		content, err := client.FetchFile(filePath)
 		if err != nil {
 			return nil, fmt.Errorf("fetching profile %s: %w", name, err)
 		}
@@ -72,7 +73,7 @@ func FetchProfiles(client *github.Client, path string) (map[string]string, error
 	}
 
 	if len(result) == 0 {
-		return nil, fmt.Errorf("no YAML profiles found in %s/%s (ref: %s)", client.Repo, path, client.Ref)
+		return nil, fmt.Errorf("no YAML profiles found in %s/%s (ref: %s) at %s", client.Subject(), path, client.Reference(), client.Endpoint())
 	}
 
 	return result, nil

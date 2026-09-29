@@ -79,8 +79,8 @@ func (d *MonitoringProfilesDataSource) Read(ctx context.Context, req datasource.
 		return
 	}
 
-	if d.providerData == nil || d.providerData.GitHubClient == nil {
-		resp.Diagnostics.AddError("Provider not configured", "The gkvm provider must be configured with a github_repo before using this data source.")
+	if d.providerData == nil || d.providerData.Client == nil {
+		resp.Diagnostics.AddError("Provider not configured", "The gkvm provider must be configured with a repository before using this data source.")
 		return
 	}
 
@@ -89,7 +89,7 @@ func (d *MonitoringProfilesDataSource) Read(ctx context.Context, req datasource.
 		profilePath = model.ProfilePath.ValueString()
 	}
 
-	allProfiles, err := monitoring.FetchProfiles(d.providerData.GitHubClient, profilePath)
+	allProfiles, err := monitoring.FetchProfiles(d.providerData.Client, profilePath)
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to fetch monitoring profiles", err.Error())
 		return

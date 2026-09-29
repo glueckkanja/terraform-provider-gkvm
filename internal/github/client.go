@@ -1,28 +1,24 @@
+// Package github reads repository content through the GitHub REST API. It
+// serves GitHub.com, GitHub Enterprise Cloud (including data residency) and
+// GitHub Enterprise Server — they differ only in the API endpoint.
 package github
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
-	"time"
+
+	"github.com/glueckkanja/terraform-provider-gkvm/internal/source"
 )
 
-// maxResponseBytes limits the size of GitHub API responses to prevent OOM from
-// malicious or unexpectedly large payloads (10 MB).
-const maxResponseBytes = 10 * 1024 * 1024
+// DefaultBaseURL is the REST API endpoint of GitHub.com.
+const DefaultBaseURL = "https://api.github.com"
 
-// httpClient is a shared HTTP client with sensible timeouts.
-var httpClient = &http.Client{
-	Timeout: 30 * time.Second,
-}
-
-// repoPattern validates the owner/repo format (alphanumeric, hyphens, underscores, dots).
-var repoPattern = regexp.MustCompile(`^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$`)
+// apiVersion pins the REST API version GitHub.com serves. Enterprise Server
+// ignores the header, so sending it is harmless there.
+const apiVersion = "2022-11-28"
 
 // Client fetches content from a GitHub repository.
 type Client struct {
@@ -30,28 +26,101 @@ type Client struct {
 	Repo  string // "owner/repo"
 	Ref   string // branch, tag, or commit SHA
 
-	// TestBaseURL and TestHTTPClient override the defaults; set only in tests.
-	TestBaseURL    string
-	TestHTTPClient *http.Client
+	// BaseURL is the REST API endpoint. Empty means DefaultBaseURL.
+	BaseURL string
+
+	// HTTPClient overrides the shared client; set only in tests.
+	HTTPClient *http.Client
 }
 
-// Entry represents a single item from the GitHub Contents API.
-type Entry struct {
-	Name        string `json:"name"`
-	Path        string `json:"path"`
-	Type        string `json:"type"` // "file" or "dir"
-	DownloadURL string `json:"download_url"`
-}
+var _ source.Client = (*Client)(nil)
 
-// ValidateConfig checks that Repo and Ref are safe before making requests.
-func (c *Client) ValidateConfig() error {
-	if !repoPattern.MatchString(c.Repo) {
-		return fmt.Errorf("invalid github_repo format %q: must be \"owner/repo\" using only alphanumeric characters, hyphens, underscores, and dots", c.Repo)
+// NormalizeBaseURL turns what a user is likely to paste into the endpoint the
+// REST API actually lives at:
+//
+//	""                              -> https://api.github.com
+//	https://api.github.com          -> unchanged
+//	https://api.SUBDOMAIN.ghe.com   -> unchanged   (Enterprise Cloud, data residency)
+//	https://HOSTNAME                -> https://HOSTNAME/api/v3   (Enterprise Server)
+//	https://HOSTNAME/api/v3         -> unchanged
+//
+// Enterprise Cloud publishes the API on an "api." hostname, Enterprise Server
+// under the /api/v3 path of the web host. Anything that already carries a path
+// is left alone, so an unusual deployment or a proxy can be addressed exactly.
+func NormalizeBaseURL(raw string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if trimmed == "" {
+		return DefaultBaseURL
 	}
-	if c.Ref != "" && strings.ContainsAny(c.Ref, " \t\n\r&?#") {
-		return fmt.Errorf("invalid github_ref %q: must not contain whitespace or URL-special characters (&, ?, #)", c.Ref)
+
+	u, err := url.Parse(trimmed)
+	if err != nil || u.Host == "" {
+		return trimmed
+	}
+	if u.Path != "" {
+		return trimmed
+	}
+	if strings.HasPrefix(u.Host, "api.") {
+		return trimmed
+	}
+	return trimmed + "/api/v3"
+}
+
+// ValidateRepo checks the "owner/repo" form GitHub requires.
+func ValidateRepo(repo string) error {
+	segments, err := source.SplitRepoSegments(repo)
+	if err == nil && len(segments) != 2 {
+		err = fmt.Errorf("%q has %d path segments", repo, len(segments))
+	}
+	if err != nil {
+		return fmt.Errorf("invalid repository %q for platform \"github\": must be \"owner/repo\" using only alphanumeric characters, hyphens, underscores, and dots (%s)", repo, err)
 	}
 	return nil
+}
+
+// CLIHost returns the hostname to pass to "gh auth token --hostname" for an
+// endpoint. The gh CLI stores credentials per deployment under its web
+// hostname: the API host without the leading "api." label
+// ("api.github.com" -> "github.com", "api.SUBDOMAIN.ghe.com" ->
+// "SUBDOMAIN.ghe.com"). Path-based endpoints such as "https://HOSTNAME/api/v3"
+// already carry the web hostname.
+func CLIHost(baseURL string) string {
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
+	host := source.Host(baseURL)
+	return strings.TrimPrefix(host, "api.")
+}
+
+// ValidateConfig checks the client configuration before any request is made.
+func (c *Client) ValidateConfig() error {
+	if c.BaseURL != "" {
+		if err := source.ValidateBaseURL(c.BaseURL); err != nil {
+			return err
+		}
+	}
+	if err := ValidateRepo(c.Repo); err != nil {
+		return err
+	}
+	return source.ValidateRef(c.Ref)
+}
+
+// Endpoint returns the API endpoint in use.
+func (c *Client) Endpoint() string {
+	if c.BaseURL == "" {
+		return DefaultBaseURL
+	}
+	return strings.TrimRight(c.BaseURL, "/")
+}
+
+// Subject returns the repository this client reads.
+func (c *Client) Subject() string {
+	return c.Repo
+}
+
+// Reference returns the git ref this client reads.
+func (c *Client) Reference() string {
+	return c.Ref
 }
 
 // Ping validates connectivity by fetching the repository root directory listing.
@@ -62,112 +131,65 @@ func (c *Client) Ping() error {
 
 // ListDirectory returns the contents of a directory path within the repository.
 // Pass an empty string for the repository root.
-func (c *Client) ListDirectory(path string) ([]Entry, error) {
-	apiURL := c.buildURL(path)
-
-	body, err := c.doRequest(apiURL, "application/vnd.github+json")
+func (c *Client) ListDirectory(path string) ([]source.Entry, error) {
+	body, err := c.requester().Get(c.contentsURL(path), "application/vnd.github+json")
 	if err != nil {
 		return nil, err
 	}
 
-	var entries []Entry
-	if err := json.Unmarshal(body, &entries); err != nil {
+	var raw []struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+		Type string `json:"type"` // "file" or "dir"
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("parsing directory listing: %w", err)
 	}
 
+	entries := make([]source.Entry, 0, len(raw))
+	for _, e := range raw {
+		entries = append(entries, source.Entry{Name: e.Name, Path: e.Path, IsDir: e.Type == "dir"})
+	}
 	return entries, nil
 }
 
-// FetchFile downloads the raw content of a file from a trusted GitHub URL.
-// The URL must point to raw.githubusercontent.com or objects.githubusercontent.com.
-func (c *Client) FetchFile(rawURL string) ([]byte, error) {
-	// Security: validate that the URL points to a trusted GitHub domain.
-	// The download_url comes from the GitHub Contents API response. A compromised
-	// repo or MITM could inject arbitrary URLs, leading to SSRF (e.g., fetching
-	// cloud metadata at 169.254.169.254 or internal network resources).
-	if !strings.HasPrefix(rawURL, "https://raw.githubusercontent.com/") &&
-		!strings.HasPrefix(rawURL, "https://objects.githubusercontent.com/") {
-		return nil, fmt.Errorf("untrusted download_url %q: must be from raw.githubusercontent.com or objects.githubusercontent.com", rawURL)
+// FetchFile returns the raw content of a file, addressed by its repository path.
+//
+// The file is read through the Contents API on the configured endpoint using
+// the raw media type, rather than by following the download_url the API
+// returns. That keeps every request on the one configured host: GitHub.com
+// serves raw content from raw.githubusercontent.com, while each Enterprise
+// deployment serves it from a host of its own, so following download_url would
+// mean guessing a second hostname per deployment and widening the set of hosts
+// the token may be sent to.
+func (c *Client) FetchFile(path string) ([]byte, error) {
+	if path == "" {
+		return nil, fmt.Errorf("empty file path")
 	}
-	return c.doRequest(rawURL, "application/octet-stream")
+	return c.requester().Get(c.contentsURL(path), "application/vnd.github.raw")
 }
 
-func (c *Client) apiBase() string {
-	if c.TestBaseURL != "" {
-		return c.TestBaseURL
+func (c *Client) requester() *source.Requester {
+	headers := map[string]string{"X-GitHub-Api-Version": apiVersion}
+	if c.Token != "" {
+		headers["Authorization"] = "Bearer " + c.Token
 	}
-	return "https://api.github.com"
+	return &source.Requester{
+		Platform:   "GitHub",
+		Subject:    c.Repo,
+		BaseURL:    c.Endpoint(),
+		Headers:    headers,
+		HTTPClient: c.HTTPClient,
+	}
 }
 
-func (c *Client) getHTTPClient() *http.Client {
-	if c.TestHTTPClient != nil {
-		return c.TestHTTPClient
-	}
-	return httpClient
-}
-
-func (c *Client) buildURL(path string) string {
-	base := fmt.Sprintf("%s/repos/%s/contents", c.apiBase(), c.Repo)
+func (c *Client) contentsURL(path string) string {
+	u := fmt.Sprintf("%s/repos/%s/contents", c.Endpoint(), c.Repo)
 	if path != "" {
-		base += "/" + path
+		u += "/" + source.EscapeSegments(path)
 	}
 	if c.Ref != "" {
-		base += "?ref=" + url.QueryEscape(c.Ref)
+		u += "?ref=" + url.QueryEscape(c.Ref)
 	}
-	return base
-}
-
-// isGitHubDomain checks that a URL points to a trusted GitHub domain.
-func isGitHubDomain(rawURL string) bool {
-	return strings.HasPrefix(rawURL, "https://api.github.com/") ||
-		strings.HasPrefix(rawURL, "https://raw.githubusercontent.com/") ||
-		strings.HasPrefix(rawURL, "https://objects.githubusercontent.com/")
-}
-
-func (c *Client) doRequest(requestURL, accept string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, requestURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
-
-	req.Header.Set("Accept", accept)
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-
-	// Security: only attach the Bearer token to known GitHub domains.
-	// This prevents token leakage if a URL somehow points elsewhere.
-	if c.Token != "" && isGitHubDomain(requestURL) {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-
-	resp, err := c.getHTTPClient().Do(req)
-	if err != nil {
-		// Sanitize error — do not leak token or full URL details in error messages.
-		return nil, fmt.Errorf("GitHub API request to %s failed: connection error (check network and token validity)", c.Repo)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	// Limit response body to prevent OOM from unexpectedly large payloads.
-	limitedReader := io.LimitReader(resp.Body, maxResponseBytes)
-	body, err := io.ReadAll(limitedReader)
-	if err != nil {
-		return nil, fmt.Errorf("reading response from %s: %w", c.Repo, err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		// Sanitize: include status code and repo but NOT the full response body,
-		// which may contain tokens or internal details from proxies/GitHub.
-		hint := ""
-		switch resp.StatusCode {
-		case 401:
-			hint = " (check that your GitHub token is valid and not expired)"
-		case 403:
-			hint = " (check token permissions — needs 'contents: read' on the repository)"
-		case 404:
-			hint = " (check that the repository, ref, and path exist)"
-		}
-		return nil, fmt.Errorf("GitHub API returned HTTP %d for %s (ref: %s)%s",
-			resp.StatusCode, c.Repo, c.Ref, hint)
-	}
-
-	return body, nil
+	return u
 }

@@ -4,11 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/glueckkanja/terraform-provider-gkvm/internal/github"
+	"github.com/glueckkanja/terraform-provider-gkvm/internal/source"
 )
 
 func TestValidatePath(t *testing.T) {
@@ -35,33 +34,108 @@ func TestValidatePath(t *testing.T) {
 	}
 }
 
-// newTestClient creates a github.Client wired to a plain-HTTP test server.
-func newTestClient(t *testing.T, handler http.Handler) (*github.Client, *httptest.Server) {
-	t.Helper()
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+// fakeClient is a source.Client backed by an in-memory repository, so the
+// fetcher is exercised independently of any backend's URL shapes.
+type fakeClient struct {
+	entries   []source.Entry
+	files     map[string][]byte
+	listErr   error
+	fetchErr  error
+	fetchedAt []string
+}
 
-	client := &github.Client{
-		Repo:           "test/repo",
-		Ref:            "main",
-		TestBaseURL:    server.URL,
-		TestHTTPClient: server.Client(),
+func (f *fakeClient) Endpoint() string  { return "https://api.example.test" }
+func (f *fakeClient) Subject() string   { return "test/repo" }
+func (f *fakeClient) Reference() string { return "main" }
+func (f *fakeClient) Ping() error       { return f.listErr }
+
+func (f *fakeClient) ListDirectory(string) ([]source.Entry, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
 	}
-	return client, server
+	return f.entries, nil
+}
+
+func (f *fakeClient) FetchFile(path string) ([]byte, error) {
+	f.fetchedAt = append(f.fetchedAt, path)
+	if f.fetchErr != nil {
+		return nil, f.fetchErr
+	}
+	content, ok := f.files[path]
+	if !ok {
+		return nil, fmt.Errorf("no such file %q", path)
+	}
+	return content, nil
+}
+
+func TestFetchProfiles_ParsesYAMLAndSkipsNonProfiles(t *testing.T) {
+	client := &fakeClient{
+		entries: []source.Entry{
+			{Name: "firewall.yaml", Path: "defaults/firewall.yaml"},
+			{Name: "README.md", Path: "defaults/README.md"},
+			{Name: "subdir", Path: "defaults/subdir", IsDir: true},
+			{Name: "empty.yaml", Path: "defaults/empty.yaml"},
+		},
+		files: map[string][]byte{
+			"defaults/firewall.yaml": []byte("metric_alerts:\n  deny_rate:\n    threshold: 10\n"),
+			"defaults/empty.yaml":    []byte("{}\n"),
+		},
+	}
+
+	profiles, err := FetchProfiles(client, "defaults")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(profiles) != 2 {
+		t.Fatalf("got %d profiles, want 2: %v", len(profiles), profiles)
+	}
+
+	var firewall struct {
+		MetricAlerts map[string]any `json:"metric_alerts"`
+		LogAlerts    map[string]any `json:"log_alerts"`
+	}
+	if err := json.Unmarshal([]byte(profiles["firewall"]), &firewall); err != nil {
+		t.Fatalf("profile is not valid JSON: %v", err)
+	}
+	if len(firewall.MetricAlerts) != 1 {
+		t.Errorf("metric_alerts = %v, want one rule", firewall.MetricAlerts)
+	}
+	// Absent sections are normalized to empty objects so consumers can index them.
+	if firewall.LogAlerts == nil {
+		t.Error("log_alerts = null, want an empty object")
+	}
+
+	// Files are addressed by repository path, never by a URL from the listing.
+	for _, path := range client.fetchedAt {
+		if !strings.HasPrefix(path, "defaults/") {
+			t.Errorf("fetched %q, want a repository path", path)
+		}
+	}
+}
+
+// An entry without a path still resolves: the directory and name are enough.
+func TestFetchProfiles_FallsBackToDirectoryAndName(t *testing.T) {
+	client := &fakeClient{
+		entries: []source.Entry{{Name: "firewall.yaml"}},
+		files:   map[string][]byte{"defaults/firewall.yaml": []byte("{}\n")},
+	}
+
+	if _, err := FetchProfiles(client, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(client.fetchedAt) != 1 || client.fetchedAt[0] != "defaults/firewall.yaml" {
+		t.Errorf("fetched %v, want defaults/firewall.yaml", client.fetchedAt)
+	}
 }
 
 func TestFetchProfiles_InvalidPath(t *testing.T) {
-	client := &github.Client{Repo: "o/r"}
-	_, err := FetchProfiles(client, "../etc")
-	if err == nil {
+	if _, err := FetchProfiles(&fakeClient{}, "../etc"); err == nil {
 		t.Fatal("expected error for invalid path, got nil")
 	}
 }
 
 func TestFetchProfiles_ListDirectoryError(t *testing.T) {
-	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "not found", http.StatusNotFound)
-	}))
+	client := &fakeClient{listErr: fmt.Errorf("HTTP %d", http.StatusNotFound)}
 
 	_, err := FetchProfiles(client, "")
 	if err == nil {
@@ -72,70 +146,44 @@ func TestFetchProfiles_ListDirectoryError(t *testing.T) {
 	}
 }
 
+func TestFetchProfiles_FetchError(t *testing.T) {
+	client := &fakeClient{
+		entries:  []source.Entry{{Name: "firewall.yaml", Path: "defaults/firewall.yaml"}},
+		fetchErr: fmt.Errorf("HTTP %d", http.StatusForbidden),
+	}
+
+	_, err := FetchProfiles(client, "")
+	if err == nil || !strings.Contains(err.Error(), "fetching profile firewall") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestFetchProfiles_MalformedYAML(t *testing.T) {
+	client := &fakeClient{
+		entries: []source.Entry{{Name: "firewall.yaml", Path: "defaults/firewall.yaml"}},
+		files:   map[string][]byte{"defaults/firewall.yaml": []byte("metric_alerts: [unclosed\n")},
+	}
+
+	_, err := FetchProfiles(client, "")
+	if err == nil || !strings.Contains(err.Error(), "parsing profile firewall") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestFetchProfiles_EmptyDirectory(t *testing.T) {
-	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// No YAML files — only a README
-		entries := []map[string]string{
-			{"name": "README.md", "type": "file", "download_url": ""},
-		}
-		if err := json.NewEncoder(w).Encode(entries); err != nil {
-			t.Errorf("encode: %v", err)
-		}
-	}))
+	client := &fakeClient{
+		entries: []source.Entry{{Name: "README.md", Path: "defaults/README.md"}},
+	}
 
 	_, err := FetchProfiles(client, "")
 	if err == nil {
-		t.Fatal("expected error for empty YAML directory, got nil")
+		t.Fatal("expected error for a directory without profiles, got nil")
 	}
-	if !strings.Contains(err.Error(), "no YAML profiles found") {
-		t.Errorf("unexpected error message: %v", err)
-	}
-}
-
-func TestFetchProfiles_MissingDownloadURL(t *testing.T) {
-	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		entries := []map[string]string{
-			{"name": "firewall.yaml", "type": "file", "download_url": ""},
+	// The message has to name the endpoint and ref: a wrong ref or a wrong
+	// endpoint is the usual cause, and both are invisible otherwise.
+	for _, want := range []string{"no YAML profiles found", "main", "https://api.example.test"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
 		}
-		if err := json.NewEncoder(w).Encode(entries); err != nil {
-			t.Errorf("encode: %v", err)
-		}
-	}))
-
-	_, err := FetchProfiles(client, "")
-	if err == nil {
-		t.Fatal("expected error for missing download_url, got nil")
-	}
-	if !strings.Contains(err.Error(), "no download_url") {
-		t.Errorf("unexpected error message: %v", err)
-	}
-}
-
-func TestFetchProfiles_SSRFGuardOnDownloadURL(t *testing.T) {
-	// The directory listing returns a download_url pointing to our test server
-	// (not a trusted GitHub domain). FetchFile must reject it.
-	var serverURL string
-	client, server := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/contents/"):
-			downloadURL := fmt.Sprintf("%s/files/firewall.yaml", serverURL)
-			entries := []map[string]string{
-				{"name": "firewall.yaml", "type": "file", "download_url": downloadURL},
-			}
-			if err := json.NewEncoder(w).Encode(entries); err != nil {
-				t.Errorf("encode: %v", err)
-			}
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	serverURL = server.URL
-
-	_, err := FetchProfiles(client, "")
-	if err == nil {
-		t.Fatal("expected SSRF guard error, got nil")
-	}
-	if !strings.Contains(err.Error(), "untrusted download_url") {
-		t.Errorf("expected SSRF guard message, got: %v", err)
 	}
 }
