@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — Configurable endpoint and GitLab support
+## [0.2.0] — Configurable endpoint and GitLab support
 
 ### Overview
 
