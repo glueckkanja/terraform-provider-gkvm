@@ -4,6 +4,7 @@
 package gitlab
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -95,7 +96,7 @@ func CLIHost(baseURL string) string {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
-	return source.Host(baseURL)
+	return source.Hostname(baseURL)
 }
 
 // ValidateConfig checks the client configuration before any request is made.
@@ -130,18 +131,18 @@ func (c *Client) Reference() string {
 }
 
 // Ping validates connectivity by fetching the project root directory listing.
-func (c *Client) Ping() error {
-	_, err := c.ListDirectory("")
+func (c *Client) Ping(ctx context.Context) error {
+	_, err := c.ListDirectory(ctx, "")
 	return err
 }
 
 // ListDirectory returns the contents of a directory path within the project.
 // Pass an empty string for the repository root.
-func (c *Client) ListDirectory(path string) ([]source.Entry, error) {
+func (c *Client) ListDirectory(ctx context.Context, path string) ([]source.Entry, error) {
 	var entries []source.Entry
 
 	for page := 1; page <= maxTreePages; page++ {
-		body, err := c.requester().Get(c.treeURL(path, page), "application/json")
+		body, err := c.requester().Get(ctx, c.treeURL(path, page), "application/json")
 		if err != nil {
 			return nil, err
 		}
@@ -170,14 +171,14 @@ func (c *Client) ListDirectory(path string) ([]source.Entry, error) {
 }
 
 // FetchFile returns the raw content of a file, addressed by its project path.
-func (c *Client) FetchFile(path string) ([]byte, error) {
+func (c *Client) FetchFile(ctx context.Context, path string) ([]byte, error) {
 	if path == "" {
 		return nil, fmt.Errorf("empty file path")
 	}
 	// The raw endpoint answers with file bytes of any type, so the request must
 	// not claim to want JSON; a strict gateway in front of the instance would
 	// answer 406.
-	return c.requester().Get(c.rawFileURL(path), "*/*")
+	return c.requester().Get(ctx, c.rawFileURL(path), "*/*")
 }
 
 func (c *Client) requester() *source.Requester {

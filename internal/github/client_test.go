@@ -1,7 +1,9 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,6 +29,13 @@ func TestNormalizeBaseURL(t *testing.T) {
 		{"enterprise server gets api/v3", "https://ghe.example.com", "https://ghe.example.com/api/v3"},
 		{"explicit path kept", "https://ghe.example.com/api/v3", "https://ghe.example.com/api/v3"},
 		{"proxy subpath kept", "https://proxy.example.com/github", "https://proxy.example.com/github"},
+		// An Enterprise Server may be named api.something; only GitHub.com
+		// itself publishes the API on a bare "api." host with no path.
+		{"enterprise server named api", "https://api.corp.example.com", "https://api.corp.example.com/api/v3"},
+		{"github.com mixed case", "https://API.github.com", "https://API.github.com"},
+		// A deliberate gateway path on a ghe.com host survives; only the
+		// mistaken Enterprise Server path is dropped.
+		{"data residency gateway path kept", "https://example.ghe.com/gateway", "https://api.example.ghe.com/gateway"},
 	}
 
 	for _, tt := range tests {
@@ -48,6 +57,12 @@ func TestCLIHost(t *testing.T) {
 		{"https://api.example.ghe.com", "example.ghe.com"},
 		{"https://ghe.example.com/api/v3", "ghe.example.com"},
 		{"https://apiserver.example.com/api/v3", "apiserver.example.com"},
+		// A path-based endpoint is addressed by its web host already, so the
+		// "api." label must not be stripped off it.
+		{"https://api.corp.example.com/api/v3", "api.corp.example.com"},
+		{"https://API.github.com", "github.com"},
+		// A port is a request detail; the CLIs key credentials by bare hostname.
+		{"https://ghe.example.com:8443/api/v3", "ghe.example.com"},
 	}
 
 	for _, tt := range tests {
@@ -123,7 +138,7 @@ func TestListDirectory_Success(t *testing.T) {
 		}
 	}))
 
-	entries, err := client.ListDirectory("defaults")
+	entries, err := client.ListDirectory(context.Background(), "defaults")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -159,7 +174,7 @@ func TestFetchFile_UsesRawMediaTypeOnTheConfiguredEndpoint(t *testing.T) {
 		_, _ = w.Write([]byte("metric_alerts: {}\n"))
 	}))
 
-	content, err := client.FetchFile("defaults/firewall.yaml")
+	content, err := client.FetchFile(context.Background(), "defaults/firewall.yaml")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -181,7 +196,7 @@ func TestFetchFile_UsesRawMediaTypeOnTheConfiguredEndpoint(t *testing.T) {
 
 func TestFetchFile_EmptyPath(t *testing.T) {
 	client := &Client{Repo: "o/r"}
-	if _, err := client.FetchFile(""); err == nil {
+	if _, err := client.FetchFile(context.Background(), ""); err == nil {
 		t.Error("expected error for empty path, got nil")
 	}
 }
@@ -195,7 +210,7 @@ func TestFetchFile_PathCannotRedirectRequest(t *testing.T) {
 		_, _ = w.Write([]byte("x"))
 	}))
 
-	if _, err := client.FetchFile("169.254.169.254/latest/meta-data"); err != nil {
+	if _, err := client.FetchFile(context.Background(), "169.254.169.254/latest/meta-data"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if want := strings.TrimPrefix(server.URL, "http://"); gotHost != want {
@@ -206,13 +221,36 @@ func TestFetchFile_PathCannotRedirectRequest(t *testing.T) {
 	}
 }
 
+// The Contents API caps a directory at 1000 entries with no pagination, so a
+// full page must be reported rather than returned as if it were complete.
+func TestListDirectory_RefusesAFullPage(t *testing.T) {
+	client, _ := newMockClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		payload := make([]map[string]string, 0, contentsListingCap)
+		for i := 0; i < contentsListingCap; i++ {
+			name := fmt.Sprintf("profile%04d.yaml", i)
+			payload = append(payload, map[string]string{"name": name, "path": "defaults/" + name, "type": "file"})
+		}
+		if err := json.NewEncoder(w).Encode(payload); err != nil {
+			t.Errorf("encode: %v", err)
+		}
+	}))
+
+	_, err := client.ListDirectory(context.Background(), "defaults")
+	if err == nil {
+		t.Fatal("expected an error for a listing at the API cap, got nil")
+	}
+	if !strings.Contains(err.Error(), "may be incomplete") {
+		t.Errorf("error does not warn about completeness: %v", err)
+	}
+}
+
 func TestListDirectory_MalformedJSON(t *testing.T) {
 	client, _ := newMockClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("not json at all {{{"))
 	}))
 
-	if _, err := client.ListDirectory("defaults"); err == nil {
+	if _, err := client.ListDirectory(context.Background(), "defaults"); err == nil {
 		t.Fatal("expected error for malformed JSON, got nil")
 	}
 }
@@ -223,14 +261,14 @@ func TestPing(t *testing.T) {
 			t.Errorf("encode: %v", err)
 		}
 	}))
-	if err := ok.Ping(); err != nil {
+	if err := ok.Ping(context.Background()); err != nil {
 		t.Errorf("Ping() unexpected error: %v", err)
 	}
 
 	bad, _ := newMockClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 	}))
-	if err := bad.Ping(); err == nil {
+	if err := bad.Ping(context.Background()); err == nil {
 		t.Error("expected error from Ping, got nil")
 	}
 }

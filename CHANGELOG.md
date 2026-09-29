@@ -28,6 +28,8 @@ names are deprecated, not removed.
   truncate a profile directory), and raw file reads through the Repository
   Files API.
 - Platform-neutral `repository`, `ref` and `token` attributes.
+- The caller's context reaches the HTTP requests, so a cancelled plan stops the
+  provider instead of running out the per-request timeout for every file.
 - `GKVM_TOKEN` environment variable, read by both platforms.
 - GitLab token resolution: `GITLAB_TOKEN`, then `CI_JOB_TOKEN`, then
   `glab auth token`. A CI job token is sent as `JOB-TOKEN`, which is the only
@@ -49,8 +51,33 @@ names are deprecated, not removed.
   The endpoint answers with file bytes of any type, so a gateway in front of a
   self-managed instance could have answered 406.
 
+### Security
+
+- Redirects are pinned to the configured endpoint. `net/http` follows
+  redirects by default and drops only `Authorization`, `Www-Authenticate`,
+  `Cookie` and `Cookie2` when the target is another domain. GitLab
+  authenticates with `PRIVATE-TOKEN` / `JOB-TOKEN`, which are not on that list,
+  and a redirect to a different port of the same host keeps every header
+  including `Authorization`. A redirect that leaves the configured endpoint is
+  now refused with an error that says so; one that stays on it is still
+  followed, so a renamed repository keeps working.
+- A response larger than the 10 MB cap is now an error instead of a truncated
+  body. A YAML profile cut at the cap is frequently still valid YAML, so the
+  alert rules past the cut would have been dropped without any error.
+- Setting a `github_*` attribute while `platform` is not `github` is now an
+  error. Previously a `github_token` left behind during a migration would have
+  been sent to the GitLab host as a private token.
+
 ### Fixed
 
+- `CLIHost` no longer strips a leading `api.` from a path-based endpoint, so an
+  Enterprise Server named `api.something` is asked for under its own hostname,
+  and no longer carries a port into `--hostname`, which neither CLI accepts.
+- A GitHub Enterprise Server whose hostname begins with `api.` now receives the
+  `/api/v3` path. Only `api.github.com` publishes the API on a bare `api.` host.
+- A GitHub directory listing that comes back at the Contents API's 1000-entry
+  cap is reported as possibly incomplete instead of being treated as the whole
+  directory.
 - Repository paths are validated segment by segment and reject relative path
   elements. `..` consists of allowed characters, so the previous pattern
   accepted a repository such as `../other-repo`.

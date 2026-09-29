@@ -140,6 +140,24 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		return
 	}
 
+	// A left-over github_* attribute on another platform is not a harmless
+	// alias: github_token would hand a GitHub credential to the GitLab host.
+	if platform != PlatformGitHub {
+		for name, value := range map[string]types.String{
+			"github_repo":  config.GithubRepo,
+			"github_ref":   config.GithubRef,
+			"github_token": config.GithubToken,
+		} {
+			if stringValue(value) != "" {
+				resp.Diagnostics.AddError(
+					"Invalid provider configuration",
+					fmt.Sprintf("%s is set while platform is %q. The github_* attributes are the deprecated GitHub-only spellings; rename them to the platform-neutral repository, ref and token before switching platform.", name, platform),
+				)
+				return
+			}
+		}
+	}
+
 	repository, err := coalesce("repository", config.Repository, "github_repo", config.GithubRepo)
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid provider configuration", err.Error())
@@ -213,13 +231,13 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		}
 	}
 
-	if err := validateClient(client); err != nil {
+	if err := client.ValidateConfig(); err != nil {
 		resp.Diagnostics.AddError("Invalid provider configuration", err.Error())
 		return
 	}
 
 	// Validate connectivity with a lightweight repository check (fail-fast).
-	if err := client.Ping(); err != nil {
+	if err := client.Ping(ctx); err != nil {
 		resp.Diagnostics.AddError(
 			"Failed to connect to the repository",
 			fmt.Sprintf("Platform: %s\nEndpoint: %s\nRepository: %s\nRef: %s\nError: %s",
@@ -291,15 +309,6 @@ func gitlabTokenHelp(endpoint string) string {
 	return fmt.Sprintf(
 		"No token found for %s.\nSet token in the provider configuration, set %s / %s / %s, or run 'glab auth login --hostname %s'.\nThe token needs the read_api scope (or read_repository) on the project.",
 		endpoint, envToken, envGitLabToken, envCIJobToken, gitlab.CLIHost(endpoint))
-}
-
-// validateClient runs the backend-specific configuration checks.
-func validateClient(client source.Client) error {
-	type validator interface{ ValidateConfig() error }
-	if v, ok := client.(validator); ok {
-		return v.ValidateConfig()
-	}
-	return nil
 }
 
 // coalesce returns the value of the current attribute, falling back to its

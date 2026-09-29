@@ -1,6 +1,7 @@
 package monitoring
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -44,19 +45,21 @@ type fakeClient struct {
 	fetchedAt []string
 }
 
-func (f *fakeClient) Endpoint() string  { return "https://api.example.test" }
-func (f *fakeClient) Subject() string   { return "test/repo" }
-func (f *fakeClient) Reference() string { return "main" }
-func (f *fakeClient) Ping() error       { return f.listErr }
+func (f *fakeClient) Endpoint() string      { return "https://api.example.test" }
+func (f *fakeClient) Subject() string       { return "test/repo" }
+func (f *fakeClient) Reference() string     { return "main" }
+func (f *fakeClient) ValidateConfig() error { return nil }
 
-func (f *fakeClient) ListDirectory(string) ([]source.Entry, error) {
+func (f *fakeClient) Ping(context.Context) error { return f.listErr }
+
+func (f *fakeClient) ListDirectory(context.Context, string) ([]source.Entry, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
 	return f.entries, nil
 }
 
-func (f *fakeClient) FetchFile(path string) ([]byte, error) {
+func (f *fakeClient) FetchFile(_ context.Context, path string) ([]byte, error) {
 	f.fetchedAt = append(f.fetchedAt, path)
 	if f.fetchErr != nil {
 		return nil, f.fetchErr
@@ -82,7 +85,7 @@ func TestFetchProfiles_ParsesYAMLAndSkipsNonProfiles(t *testing.T) {
 		},
 	}
 
-	profiles, err := FetchProfiles(client, "defaults")
+	profiles, err := FetchProfiles(context.Background(), client, "defaults")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -120,7 +123,7 @@ func TestFetchProfiles_FallsBackToDirectoryAndName(t *testing.T) {
 		files:   map[string][]byte{"defaults/firewall.yaml": []byte("{}\n")},
 	}
 
-	if _, err := FetchProfiles(client, ""); err != nil {
+	if _, err := FetchProfiles(context.Background(), client, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(client.fetchedAt) != 1 || client.fetchedAt[0] != "defaults/firewall.yaml" {
@@ -129,7 +132,7 @@ func TestFetchProfiles_FallsBackToDirectoryAndName(t *testing.T) {
 }
 
 func TestFetchProfiles_InvalidPath(t *testing.T) {
-	if _, err := FetchProfiles(&fakeClient{}, "../etc"); err == nil {
+	if _, err := FetchProfiles(context.Background(), &fakeClient{}, "../etc"); err == nil {
 		t.Fatal("expected error for invalid path, got nil")
 	}
 }
@@ -137,7 +140,7 @@ func TestFetchProfiles_InvalidPath(t *testing.T) {
 func TestFetchProfiles_ListDirectoryError(t *testing.T) {
 	client := &fakeClient{listErr: fmt.Errorf("HTTP %d", http.StatusNotFound)}
 
-	_, err := FetchProfiles(client, "")
+	_, err := FetchProfiles(context.Background(), client, "")
 	if err == nil {
 		t.Fatal("expected error when directory listing fails, got nil")
 	}
@@ -152,7 +155,7 @@ func TestFetchProfiles_FetchError(t *testing.T) {
 		fetchErr: fmt.Errorf("HTTP %d", http.StatusForbidden),
 	}
 
-	_, err := FetchProfiles(client, "")
+	_, err := FetchProfiles(context.Background(), client, "")
 	if err == nil || !strings.Contains(err.Error(), "fetching profile firewall") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -164,7 +167,7 @@ func TestFetchProfiles_MalformedYAML(t *testing.T) {
 		files:   map[string][]byte{"defaults/firewall.yaml": []byte("metric_alerts: [unclosed\n")},
 	}
 
-	_, err := FetchProfiles(client, "")
+	_, err := FetchProfiles(context.Background(), client, "")
 	if err == nil || !strings.Contains(err.Error(), "parsing profile firewall") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -175,7 +178,7 @@ func TestFetchProfiles_EmptyDirectory(t *testing.T) {
 		entries: []source.Entry{{Name: "README.md", Path: "defaults/README.md"}},
 	}
 
-	_, err := FetchProfiles(client, "")
+	_, err := FetchProfiles(context.Background(), client, "")
 	if err == nil {
 		t.Fatal("expected error for a directory without profiles, got nil")
 	}

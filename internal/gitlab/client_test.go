@@ -1,6 +1,7 @@
 package gitlab
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -37,6 +38,10 @@ func TestCLIHost(t *testing.T) {
 	}
 	if got := CLIHost("https://gitlab.example.com/api/v4"); got != "gitlab.example.com" {
 		t.Errorf("CLIHost() = %q", got)
+	}
+	// A port belongs in the request, never in the CLI hostname.
+	if got := CLIHost("https://gitlab.example.com:8443/api/v4"); got != "gitlab.example.com" {
+		t.Errorf("CLIHost() with a port = %q, want the bare hostname", got)
 	}
 }
 
@@ -98,7 +103,7 @@ func TestListDirectory_EncodesProjectAndSendsPrivateToken(t *testing.T) {
 		}
 	}))
 
-	entries, err := client.ListDirectory("defaults")
+	entries, err := client.ListDirectory(context.Background(), "defaults")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -152,7 +157,7 @@ func TestListDirectory_ReadsEveryPage(t *testing.T) {
 		}
 	}))
 
-	entries, err := client.ListDirectory("defaults")
+	entries, err := client.ListDirectory(context.Background(), "defaults")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -173,7 +178,7 @@ func TestFetchFile_EncodesPathAndStaysOnEndpoint(t *testing.T) {
 		_, _ = w.Write([]byte("metric_alerts: {}\n"))
 	}))
 
-	content, err := client.FetchFile("defaults/firewall.yaml")
+	content, err := client.FetchFile(context.Background(), "defaults/firewall.yaml")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -204,7 +209,7 @@ func TestFetchFile_JobTokenUsesItsOwnHeader(t *testing.T) {
 	}))
 	client.TokenHeader = JobTokenHeader
 
-	if _, err := client.FetchFile("defaults/firewall.yaml"); err != nil {
+	if _, err := client.FetchFile(context.Background(), "defaults/firewall.yaml"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if gotJob != "test-token" {
@@ -217,7 +222,7 @@ func TestFetchFile_JobTokenUsesItsOwnHeader(t *testing.T) {
 
 func TestFetchFile_EmptyPath(t *testing.T) {
 	client := &Client{Project: "group/project"}
-	if _, err := client.FetchFile(""); err == nil {
+	if _, err := client.FetchFile(context.Background(), ""); err == nil {
 		t.Error("expected error for empty path, got nil")
 	}
 }
@@ -226,7 +231,7 @@ func TestPing(t *testing.T) {
 	bad, _ := newMockClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 	}))
-	if err := bad.Ping(); err == nil {
+	if err := bad.Ping(context.Background()); err == nil {
 		t.Error("expected error from Ping, got nil")
 	}
 }

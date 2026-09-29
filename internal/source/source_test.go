@@ -1,8 +1,10 @@
 package source
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -84,6 +86,206 @@ func TestSplitRepoSegments(t *testing.T) {
 	}
 }
 
+func TestHostnameAndHasPath(t *testing.T) {
+	tests := []struct {
+		in           string
+		wantHost     string
+		wantHostname string
+		wantHasPath  bool
+	}{
+		{"https://api.github.com", "api.github.com", "api.github.com", false},
+		{"https://ghe.example.com/api/v3", "ghe.example.com", "ghe.example.com", true},
+		// A port belongs in a request target but never in a CLI hostname.
+		{"https://gitlab.example.com:8443/api/v4", "gitlab.example.com:8443", "gitlab.example.com", true},
+		{"https://gitlab.example.com:8443", "gitlab.example.com:8443", "gitlab.example.com", false},
+		{"https://ghe.example.com/", "ghe.example.com", "ghe.example.com", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := Host(tt.in); got != tt.wantHost {
+				t.Errorf("Host() = %q, want %q", got, tt.wantHost)
+			}
+			if got := Hostname(tt.in); got != tt.wantHostname {
+				t.Errorf("Hostname() = %q, want %q", got, tt.wantHostname)
+			}
+			if got := HasPath(tt.in); got != tt.wantHasPath {
+				t.Errorf("HasPath() = %v, want %v", got, tt.wantHasPath)
+			}
+		})
+	}
+}
+
+// net/http follows redirects by default and drops only Authorization,
+// Www-Authenticate, Cookie and Cookie2 across hosts. GitLab authenticates with
+// PRIVATE-TOKEN, which is not on that list, so a redirect the endpoint chooses
+// would otherwise hand the credential to any host it names.
+func TestGet_RefusesRedirectOffTheEndpoint(t *testing.T) {
+	var leakedPrivate, leakedJob, leakedAuth string
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		leakedAuth = req.Header.Get("Authorization")
+		leakedPrivate = req.Header.Get("PRIVATE-TOKEN")
+		leakedJob = req.Header.Get("JOB-TOKEN")
+		_, _ = w.Write([]byte("attacker payload"))
+	}))
+	t.Cleanup(foreign.Close)
+
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		http.Redirect(w, req, foreign.URL+"/steal", http.StatusFound)
+	}))
+	t.Cleanup(endpoint.Close)
+
+	r := &Requester{
+		Platform: "GitLab",
+		Subject:  "group/project",
+		BaseURL:  endpoint.URL,
+		Headers: map[string]string{
+			"Authorization": "Bearer gh-secret",
+			"PRIVATE-TOKEN": "glpat-secret",
+			"JOB-TOKEN":     "job-secret",
+		},
+		HTTPClient: endpoint.Client(),
+	}
+
+	body, err := r.Get(context.Background(), r.Base()+"/anything", "application/json")
+
+	// The credentials are checked first: a leak is the consequence that matters,
+	// and it must be reported even if the call somehow returned no error.
+	for name, got := range map[string]string{"Authorization": leakedAuth, "PRIVATE-TOKEN": leakedPrivate, "JOB-TOKEN": leakedJob} {
+		if got != "" {
+			t.Errorf("%s reached the foreign host: %q", name, got)
+		}
+	}
+	if err == nil {
+		t.Fatalf("expected the redirect to be refused, got body %q", body)
+	}
+	if !strings.Contains(err.Error(), "redirected away from the configured endpoint") {
+		t.Errorf("error does not explain the refusal: %v", err)
+	}
+	if body != nil {
+		t.Errorf("body = %q, want nothing from the redirect target", body)
+	}
+}
+
+// The same leak with a genuinely different hostname. net/http strips
+// Authorization across domains but its sensitive-header list covers only
+// Authorization, Www-Authenticate, Cookie and Cookie2, so GitLab's
+// PRIVATE-TOKEN survives the hop. The endpoint pin is what stops it; the
+// hostname differs from the listener's 127.0.0.1 while resolving to it, so the
+// target is genuinely reachable and genuinely a different host to net/http.
+func TestGet_RefusesRedirectToAnotherHostname(t *testing.T) {
+	var (
+		reached bool
+		target  string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/elsewhere" {
+			reached = true
+			_, _ = w.Write([]byte("attacker payload"))
+			return
+		}
+		http.Redirect(w, req, target, http.StatusFound)
+	}))
+	t.Cleanup(server.Close)
+	target = "http://localhost:" + portOf(t, server.URL) + "/elsewhere"
+
+	r := &Requester{
+		Platform:   "GitLab",
+		Subject:    "group/project",
+		BaseURL:    server.URL,
+		Headers:    map[string]string{"PRIVATE-TOKEN": "glpat-secret"},
+		HTTPClient: server.Client(),
+	}
+
+	if _, err := r.Get(context.Background(), r.Base()+"/anything", "application/json"); err == nil {
+		t.Fatal("expected the redirect to be refused, got nil")
+	}
+	if reached {
+		t.Error("the request followed the redirect to the other hostname")
+	}
+}
+
+func portOf(t *testing.T, rawURL string) string {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse %q: %v", rawURL, err)
+	}
+	return u.Port()
+}
+
+// A redirect that stays on the endpoint is normal (a renamed repository, a
+// canonical path) and must still be followed.
+func TestGet_FollowsRedirectOnTheEndpoint(t *testing.T) {
+	var sawPrivate string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/moved", func(w http.ResponseWriter, req *http.Request) {
+		http.Redirect(w, req, "/final", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/final", func(w http.ResponseWriter, req *http.Request) {
+		sawPrivate = req.Header.Get("PRIVATE-TOKEN")
+		_, _ = w.Write([]byte("ok"))
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	r := &Requester{
+		Platform:   "GitLab",
+		Subject:    "group/project",
+		BaseURL:    server.URL,
+		Headers:    map[string]string{"PRIVATE-TOKEN": "glpat-secret"},
+		HTTPClient: server.Client(),
+	}
+
+	body, err := r.Get(context.Background(), r.Base()+"/moved", "application/json")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(body) != "ok" {
+		t.Errorf("body = %q", body)
+	}
+	if sawPrivate != "glpat-secret" {
+		t.Errorf("PRIVATE-TOKEN = %q, want it kept on the endpoint", sawPrivate)
+	}
+}
+
+// A body cut at the size cap is often still parseable — a truncated YAML
+// profile would silently drop the alert rules past the cut — so the cap has to
+// be an error, not a shorter result.
+func TestGet_RejectsOversizedResponse(t *testing.T) {
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		chunk := strings.Repeat("a", 1024*1024)
+		for i := 0; i < 11; i++ {
+			_, _ = w.Write([]byte(chunk))
+		}
+	}))
+
+	_, err := r.Get(context.Background(), r.Base()+"/big", "application/json")
+	if err == nil {
+		t.Fatal("expected an error for an oversized response, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds the") {
+		t.Errorf("error does not name the limit: %v", err)
+	}
+}
+
+func TestGet_HonoursContextCancellation(t *testing.T) {
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := r.Get(ctx, r.Base()+"/anything", "application/json")
+	if err == nil {
+		t.Fatal("expected an error for a cancelled context, got nil")
+	}
+	if !strings.Contains(err.Error(), "cancelled") {
+		t.Errorf("error does not report the cancellation: %v", err)
+	}
+}
+
 func TestEscaping(t *testing.T) {
 	if got := EscapeSegments("defaults/a b.yaml"); got != "defaults/a%20b.yaml" {
 		t.Errorf("EscapeSegments = %q", got)
@@ -115,7 +317,7 @@ func TestGet_SendsHeadersToConfiguredEndpoint(t *testing.T) {
 		_, _ = w.Write([]byte("ok"))
 	}))
 
-	body, err := r.Get(r.Base()+"/anything", "application/json")
+	body, err := r.Get(context.Background(), r.Base()+"/anything", "application/json")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -141,7 +343,7 @@ func TestGet_RefusesForeignHost(t *testing.T) {
 		"https://api.github.com.evil.example/steal",
 	}
 	for _, u := range foreign {
-		if _, err := r.Get(u, "application/json"); err == nil {
+		if _, err := r.Get(context.Background(), u, "application/json"); err == nil {
 			t.Errorf("expected refusal for %q, got nil", u)
 		}
 	}
@@ -166,7 +368,7 @@ func TestGet_HTTPErrorsAndTokenSafety(t *testing.T) {
 			}))
 			r.Headers = map[string]string{"Authorization": "Bearer super-secret-token"}
 
-			_, err := r.Get(r.Base()+"/anything", "application/json")
+			_, err := r.Get(context.Background(), r.Base()+"/anything", "application/json")
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}

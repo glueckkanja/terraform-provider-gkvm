@@ -158,6 +158,18 @@ func TestConfigure_Rejects(t *testing.T) {
 			attrs:      map[string]string{"platform": "gitlab", "repository": "project"},
 			wantSubstr: "namespace",
 		},
+		// A left-over github_token on GitLab would send a GitHub credential to
+		// the GitLab host as a private token.
+		{
+			name:       "github_token left behind on gitlab",
+			attrs:      map[string]string{"platform": "gitlab", "repository": "group/project", "github_token": "ghp_x"},
+			wantSubstr: "github_token is set while platform is",
+		},
+		{
+			name:       "github_repo left behind on gitlab",
+			attrs:      map[string]string{"platform": "gitlab", "github_repo": "group/project"},
+			wantSubstr: "github_repo is set while platform is",
+		},
 	}
 
 	for _, tt := range tests {

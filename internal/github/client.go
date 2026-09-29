@@ -4,6 +4,7 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -19,6 +20,10 @@ const DefaultBaseURL = "https://api.github.com"
 // apiVersion pins the REST API version GitHub.com serves. Enterprise Server
 // ignores the header, so sending it is harmless there.
 const apiVersion = "2022-11-28"
+
+// contentsListingCap is the number of entries the Contents API serves for one
+// directory. There is no pagination past it.
+const contentsListingCap = 1000
 
 // Client fetches content from a GitHub repository.
 type Client struct {
@@ -70,12 +75,20 @@ func NormalizeBaseURL(raw string) string {
 		if !strings.HasPrefix(strings.ToLower(host), "api.") {
 			host = "api." + host
 		}
+		// The Enterprise Server path is the mistake being corrected, so it is
+		// dropped; any other path is a deliberate gateway route and is kept.
+		if path := strings.Trim(u.Path, "/"); path != "" && path != "api/v3" {
+			return u.Scheme + "://" + host + "/" + path
+		}
 		return u.Scheme + "://" + host
 	}
 	if u.Path != "" {
 		return trimmed
 	}
-	if strings.HasPrefix(u.Host, "api.") {
+	// Only GitHub.com itself publishes the API on a bare "api." host without a
+	// path. An Enterprise Server may well be named api.something, and matching
+	// it on the prefix alone would leave out the /api/v3 route it needs.
+	if strings.EqualFold(u.Host, "api.github.com") {
 		return trimmed
 	}
 	return trimmed + "/api/v3"
@@ -109,8 +122,24 @@ func CLIHost(baseURL string) string {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
-	host := source.Host(baseURL)
-	return strings.TrimPrefix(host, "api.")
+	host := source.Hostname(baseURL)
+	// A path-based endpoint is already addressed by its web host; only the
+	// host-based Enterprise Cloud shape carries the extra "api." label.
+	if source.HasPath(baseURL) {
+		return host
+	}
+	if rest, ok := cutPrefixFold(host, "api."); ok {
+		return rest
+	}
+	return host
+}
+
+// cutPrefixFold removes a case-insensitive prefix.
+func cutPrefixFold(s, prefix string) (string, bool) {
+	if len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix) {
+		return s[len(prefix):], true
+	}
+	return s, false
 }
 
 // ValidateConfig checks the client configuration before any request is made.
@@ -145,15 +174,15 @@ func (c *Client) Reference() string {
 }
 
 // Ping validates connectivity by fetching the repository root directory listing.
-func (c *Client) Ping() error {
-	_, err := c.ListDirectory("")
+func (c *Client) Ping(ctx context.Context) error {
+	_, err := c.ListDirectory(ctx, "")
 	return err
 }
 
 // ListDirectory returns the contents of a directory path within the repository.
 // Pass an empty string for the repository root.
-func (c *Client) ListDirectory(path string) ([]source.Entry, error) {
-	body, err := c.requester().Get(c.contentsURL(path), "application/vnd.github+json")
+func (c *Client) ListDirectory(ctx context.Context, path string) ([]source.Entry, error) {
+	body, err := c.requester().Get(ctx, c.contentsURL(path), "application/vnd.github+json")
 	if err != nil {
 		return nil, err
 	}
@@ -165,6 +194,13 @@ func (c *Client) ListDirectory(path string) ([]source.Entry, error) {
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("parsing directory listing: %w", err)
+	}
+
+	// The Contents API caps a directory listing at 1000 entries and offers no
+	// pagination, so a larger directory would come back partial with no error.
+	if len(raw) >= contentsListingCap {
+		return nil, fmt.Errorf("directory %q in %s returned %d entries, the maximum the GitHub Contents API serves — the listing may be incomplete, so split the directory instead of trusting a partial result",
+			path, c.Repo, len(raw))
 	}
 
 	entries := make([]source.Entry, 0, len(raw))
@@ -183,11 +219,11 @@ func (c *Client) ListDirectory(path string) ([]source.Entry, error) {
 // deployment serves it from a host of its own, so following download_url would
 // mean guessing a second hostname per deployment and widening the set of hosts
 // the token may be sent to.
-func (c *Client) FetchFile(path string) ([]byte, error) {
+func (c *Client) FetchFile(ctx context.Context, path string) ([]byte, error) {
 	if path == "" {
 		return nil, fmt.Errorf("empty file path")
 	}
-	return c.requester().Get(c.contentsURL(path), "application/vnd.github.raw")
+	return c.requester().Get(ctx, c.contentsURL(path), "application/vnd.github.raw")
 }
 
 func (c *Client) requester() *source.Requester {

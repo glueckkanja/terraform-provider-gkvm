@@ -1,6 +1,7 @@
 package monitoring
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -19,7 +20,7 @@ func ValidatePath(path string) error {
 
 // FetchProfiles lists YAML files in the given directory and returns parsed profiles as JSON strings.
 // If path is empty, it defaults to "defaults".
-func FetchProfiles(client source.Client, path string) (map[string]string, error) {
+func FetchProfiles(ctx context.Context, client source.Client, path string) (map[string]string, error) {
 	if err := ValidatePath(path); err != nil {
 		return nil, err
 	}
@@ -28,7 +29,7 @@ func FetchProfiles(client source.Client, path string) (map[string]string, error)
 		path = "defaults"
 	}
 
-	entries, err := client.ListDirectory(path)
+	entries, err := client.ListDirectory(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("listing profiles directory: %w", err)
 	}
@@ -47,7 +48,7 @@ func FetchProfiles(client source.Client, path string) (map[string]string, error)
 			filePath = path + "/" + entry.Name
 		}
 
-		content, err := client.FetchFile(filePath)
+		content, err := client.FetchFile(ctx, filePath)
 		if err != nil {
 			return nil, fmt.Errorf("fetching profile %s: %w", name, err)
 		}

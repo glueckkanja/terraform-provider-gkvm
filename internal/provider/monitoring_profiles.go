@@ -89,7 +89,7 @@ func (d *MonitoringProfilesDataSource) Read(ctx context.Context, req datasource.
 		profilePath = model.ProfilePath.ValueString()
 	}
 
-	allProfiles, err := monitoring.FetchProfiles(d.providerData.Client, profilePath)
+	allProfiles, err := monitoring.FetchProfiles(ctx, d.providerData.Client, profilePath)
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to fetch monitoring profiles", err.Error())
 		return

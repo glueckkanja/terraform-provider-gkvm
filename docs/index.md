@@ -141,6 +141,10 @@ the file contents alike. Raw file content is read through the API with the raw
 media type rather than by following the `download_url` the API returns, so no
 second hostname has to be reachable and the token is never sent anywhere else.
 
+That also holds for redirects: one that stays on the configured endpoint is
+followed, one that leaves it is refused with an error naming the target. A
+redirect cannot be used to move the token to another host.
+
 Allow outbound HTTPS from the machine running Terraform to:
 
 | Platform | Host |
@@ -160,8 +164,11 @@ Rename them when convenient:
 | `github_ref` | `ref` |
 | `github_token` | `token` |
 
-Setting both spellings to different values is an error. A configuration that
-only sets the old names keeps reading GitHub.com exactly as before.
+Setting both spellings to different values is an error, and so is setting any
+`github_*` attribute while `platform` is not `github` — a `github_token` left
+behind during a migration would otherwise be sent to the GitLab host. A
+configuration that only sets the old names keeps reading GitHub.com exactly as
+before.
 
 ## Schema
 
