@@ -46,7 +46,11 @@ names are deprecated, not removed.
   resolves to (`gh auth token --hostname HOST`). Previously the CLI default
   host was used, so a CLI logged into an Enterprise host handed out a token
   that `api.github.com` then rejected with a misleading 401.
-- Error messages name the endpoint, the repository and the ref.
+- Error messages name the endpoint, the repository and the ref, and a failed
+  connection reports the transport cause ("no such host", "connection
+  refused", a TLS error) instead of a generic "connection error". A wrong
+  endpoint is the likeliest misconfiguration and the old message sent the user
+  looking at their token. The request URL is still kept out of the message.
 - The GitLab raw file request asks for `*/*` instead of `application/json`.
   The endpoint answers with file bytes of any type, so a gateway in front of a
   self-managed instance could have answered 406.

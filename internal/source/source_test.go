@@ -269,6 +269,40 @@ func TestGet_RejectsOversizedResponse(t *testing.T) {
 	}
 }
 
+// A wrong endpoint is the most likely misconfiguration, and the transport says
+// exactly what is wrong. Flattening that into "connection error" sent the user
+// looking at their token instead.
+func TestGet_ReportsTheTransportCauseWithoutTheURL(t *testing.T) {
+	// A server that is closed immediately leaves a port nothing listens on.
+	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	client := closed.Client()
+	base := closed.URL
+	closed.Close()
+
+	r := &Requester{
+		Platform:   "GitHub",
+		Subject:    "owner/repo",
+		BaseURL:    base,
+		Headers:    map[string]string{"Authorization": "Bearer super-secret-token"},
+		HTTPClient: client,
+	}
+
+	_, err := r.Get(context.Background(), r.Base()+"/repos/owner/repo/contents", "application/json")
+	if err == nil {
+		t.Fatal("expected an error against a closed port, got nil")
+	}
+	if !strings.Contains(err.Error(), "refused") {
+		t.Errorf("error does not name the transport cause: %v", err)
+	}
+	// The cause must not drag the request URL or the credential along.
+	if strings.Contains(err.Error(), "/repos/owner/repo/contents") {
+		t.Errorf("error echoes the request URL: %v", err)
+	}
+	if strings.Contains(err.Error(), "super-secret-token") {
+		t.Errorf("credential leaked in error message: %v", err)
+	}
+}
+
 func TestGet_HonoursContextCancellation(t *testing.T) {
 	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))

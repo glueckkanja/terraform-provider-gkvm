@@ -269,10 +269,18 @@ func (r *Requester) Get(ctx context.Context, requestURL, accept string) ([]byte,
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("%s API request to %s for %s was cancelled: %w", r.Platform, r.Base(), r.Subject, ctxErr)
 		}
-		// Sanitize: report what the user can act on, never the credentials or
-		// the full URL.
-		return nil, fmt.Errorf("%s API request to %s for %s failed: connection error (check network, endpoint and token validity)",
-			r.Platform, r.Base(), r.Subject)
+		// Report the transport cause but not the request URL. net/http wraps
+		// every failure in a *url.Error that repeats the URL; the cause inside
+		// it ("no such host", "connection refused", a TLS error) is the part
+		// that says what to fix, and carries no credentials — the token travels
+		// in a header and an endpoint with userinfo is rejected up front.
+		cause := error(err)
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) && urlErr.Err != nil {
+			cause = urlErr.Err
+		}
+		return nil, fmt.Errorf("%s API request to %s for %s failed: %v (check network, endpoint and token validity)",
+			r.Platform, r.Base(), r.Subject, cause)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
