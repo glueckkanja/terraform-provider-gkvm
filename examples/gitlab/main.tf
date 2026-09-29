@@ -15,10 +15,14 @@ provider "gkvm" {
   repository = "my-group/platform/gkvm-monitoring-defaults"
   ref        = "main"
 
-  # Token resolution, in order: token, GKVM_TOKEN, GITLAB_TOKEN, CI_JOB_TOKEN,
+  # Token resolution, in order: token, GKVM_TOKEN, GITLAB_TOKEN,
   # then "glab auth token --hostname gitlab.example.com".
   # The token needs the read_api scope and at least the Reporter role.
-  # A CI_JOB_TOKEN is sent as JOB-TOKEN, which is the header GitLab accepts it in.
+  #
+  # A CI job token (CI_JOB_TOKEN) does NOT work: GitLab's job token allowlist
+  # covers the raw file endpoint but not the repository tree endpoint used to
+  # discover the profiles, and GitLab ignores JOB-TOKEN outside that allowlist
+  # rather than rejecting it. Use a project or group access token in pipelines.
 }
 
 data "gkvm_monitoring_profiles" "all" {}

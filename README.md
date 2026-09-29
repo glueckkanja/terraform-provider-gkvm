@@ -46,7 +46,7 @@ provider "gkvm" {
 }
 ```
 
-The token is resolved automatically: `GKVM_TOKEN`, then `GH_TOKEN` / `GITHUB_TOKEN` (GitHub) or `GITLAB_TOKEN` / `CI_JOB_TOKEN` (GitLab), then the platform CLI (`gh auth token` / `glab auth token`) for the host in `base_url`. Set `token` in the provider block only if none of those is available.
+The token is resolved automatically: `GKVM_TOKEN`, then `GH_TOKEN` / `GITHUB_TOKEN` (GitHub) or `GITLAB_TOKEN` (GitLab), then the platform CLI (`gh auth token` / `glab auth token`) for the host in `base_url`. Set `token` in the provider block only if none of those is available.
 
 Every request stays on the host in `base_url` — no second hostname has to be reachable. See [the provider documentation](docs/index.md) for endpoints, permissions and the migration from v0.1.x attribute names.
 

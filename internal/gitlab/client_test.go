@@ -92,7 +92,7 @@ func TestListDirectory_EncodesProjectAndSendsPrivateToken(t *testing.T) {
 
 	client, _ := newMockClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEscapedPath, gotQuery = r.URL.EscapedPath(), r.URL.Query().Encode()
-		gotPrivate, gotJob = r.Header.Get(PrivateTokenHeader), r.Header.Get(JobTokenHeader)
+		gotPrivate, gotJob = r.Header.Get(PrivateTokenHeader), r.Header.Get("JOB-TOKEN")
 
 		payload := []map[string]string{
 			{"name": "firewall.yaml", "path": "defaults/firewall.yaml", "type": "blob"},
@@ -123,8 +123,10 @@ func TestListDirectory_EncodesProjectAndSendsPrivateToken(t *testing.T) {
 	if gotPrivate != "test-token" {
 		t.Errorf("%s = %q, want the configured token", PrivateTokenHeader, gotPrivate)
 	}
+	// A job token is never sent: GitLab ignores JOB-TOKEN on the tree endpoint
+	// instead of rejecting it, so it would read as anonymous access.
 	if gotJob != "" {
-		t.Errorf("%s = %q, want it unset for a private token", JobTokenHeader, gotJob)
+		t.Errorf("JOB-TOKEN = %q, want it never sent", gotJob)
 	}
 }
 
@@ -200,23 +202,22 @@ func TestFetchFile_EncodesPathAndStaysOnEndpoint(t *testing.T) {
 	}
 }
 
-func TestFetchFile_JobTokenUsesItsOwnHeader(t *testing.T) {
+func TestFetchFile_SendsOnlyThePrivateTokenHeader(t *testing.T) {
 	var gotPrivate, gotJob string
 
 	client, _ := newMockClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPrivate, gotJob = r.Header.Get(PrivateTokenHeader), r.Header.Get(JobTokenHeader)
+		gotPrivate, gotJob = r.Header.Get(PrivateTokenHeader), r.Header.Get("JOB-TOKEN")
 		_, _ = w.Write([]byte("x"))
 	}))
-	client.TokenHeader = JobTokenHeader
 
 	if _, err := client.FetchFile(context.Background(), "defaults/firewall.yaml"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if gotJob != "test-token" {
-		t.Errorf("%s = %q, want the job token", JobTokenHeader, gotJob)
+	if gotPrivate != "test-token" {
+		t.Errorf("%s = %q, want the configured token", PrivateTokenHeader, gotPrivate)
 	}
-	if gotPrivate != "" {
-		t.Errorf("%s = %q, want it unset for a job token", PrivateTokenHeader, gotPrivate)
+	if gotJob != "" {
+		t.Errorf("JOB-TOKEN = %q, want it never sent", gotJob)
 	}
 }
 

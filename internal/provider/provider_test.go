@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/glueckkanja/terraform-provider-gkvm/internal/gitlab"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -242,29 +241,36 @@ func TestResolveGitHubToken_Precedence(t *testing.T) {
 	}
 }
 
-func TestResolveGitLabToken_PrecedenceAndHeader(t *testing.T) {
+func TestResolveGitLabToken_Precedence(t *testing.T) {
 	t.Setenv(envToken, "")
 	t.Setenv(envGitLabToken, "")
 	t.Setenv(envCIJobToken, "")
 
-	token, header := resolveGitLabToken(context.Background(), "from-config", "https://gitlab.example.com/api/v4")
-	if token != "from-config" || header != gitlab.PrivateTokenHeader {
-		t.Errorf("got %q/%q, want the configured token as a private token", token, header)
+	if got := resolveGitLabToken(context.Background(), "from-config", "https://gitlab.example.com/api/v4"); got != "from-config" {
+		t.Errorf("token = %q, want the configured one to win", got)
 	}
 
 	t.Setenv(envGitLabToken, "from-gitlab")
-	token, header = resolveGitLabToken(context.Background(), "", "https://gitlab.example.com/api/v4")
-	if token != "from-gitlab" || header != gitlab.PrivateTokenHeader {
-		t.Errorf("got %q/%q, want GITLAB_TOKEN as a private token", token, header)
+	if got := resolveGitLabToken(context.Background(), "", "https://gitlab.example.com/api/v4"); got != "from-gitlab" {
+		t.Errorf("token = %q, want GITLAB_TOKEN", got)
 	}
+}
 
-	// A CI job token is rejected when sent as a private token, so finding one
-	// has to switch the header.
+// GitLab's job token allowlist does not cover the repository tree endpoint, and
+// GitLab ignores the header there rather than rejecting it, so a job token
+// would read as anonymous. It must not be picked up silently.
+func TestResolveGitLabToken_IgnoresCIJobToken(t *testing.T) {
+	t.Setenv(envToken, "")
 	t.Setenv(envGitLabToken, "")
 	t.Setenv(envCIJobToken, "from-ci")
-	token, header = resolveGitLabToken(context.Background(), "", "https://gitlab.example.com/api/v4")
-	if token != "from-ci" || header != gitlab.JobTokenHeader {
-		t.Errorf("got %q/%q, want CI_JOB_TOKEN as a job token", token, header)
+
+	if got := resolveGitLabToken(context.Background(), "", "https://gitlab.example.com/api/v4"); got == "from-ci" {
+		t.Error("CI_JOB_TOKEN was used as a token, but it cannot authenticate the tree endpoint")
+	}
+
+	help := gitlabTokenHelp("https://gitlab.example.com/api/v4")
+	if !strings.Contains(help, envCIJobToken) || !strings.Contains(help, "allowlist") {
+		t.Errorf("help does not explain why the job token is unusable: %s", help)
 	}
 }
 

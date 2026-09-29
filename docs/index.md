@@ -107,7 +107,7 @@ The token is resolved from the first source that yields a value:
 | 1 | `token` in the provider block | `token` in the provider block |
 | 2 | `GKVM_TOKEN` | `GKVM_TOKEN` |
 | 3 | `GH_TOKEN` | `GITLAB_TOKEN` |
-| 4 | `GITHUB_TOKEN` | `CI_JOB_TOKEN` |
+| 4 | `GITHUB_TOKEN` | — |
 | 5 | `gh auth token --hostname HOST` | `glab auth token --hostname HOST` |
 
 `GH_TOKEN` is checked before `GITHUB_TOKEN` because GitHub Actions injects
@@ -126,11 +126,19 @@ Required permissions:
 - **GitHub** — `contents: read` on the repository. A fine-grained personal
   access token, a GitHub App installation token, or a classic token with `repo`
   for a private repository all work.
-- **GitLab** — a token with the `read_api` scope whose identity has at least
-  the Reporter role on the project. Personal, group and project access tokens
-  are sent as `PRIVATE-TOKEN`. A `CI_JOB_TOKEN` is sent as `JOB-TOKEN` instead,
-  because GitLab rejects a job token presented as a private token; reading
-  another project with a job token requires that project to allow it.
+- **GitLab** — a token with the `read_api` scope (`read_repository` also grants
+  read access to repository files) whose identity has at least the Reporter
+  role on the project. Personal, group and project access tokens are sent as
+  `PRIVATE-TOKEN`.
+
+  **A CI job token (`CI_JOB_TOKEN`) cannot be used.** GitLab's job token
+  allowlist covers `GET /projects/:id/repository/files/:file_path/raw` but not
+  the repository tree endpoint this provider needs to discover the profiles,
+  and on a route outside that allowlist GitLab ignores the `JOB-TOKEN` header
+  instead of rejecting it — the read would silently fall back to anonymous
+  access and fail with a 404 on a private project. In a pipeline, use a
+  project or group access token. The provider says so explicitly when it finds
+  `CI_JOB_TOKEN` set and no usable token.
 
 Tokens are never written to state and never appear in error messages.
 

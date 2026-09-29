@@ -31,9 +31,17 @@ names are deprecated, not removed.
 - The caller's context reaches the HTTP requests, so a cancelled plan stops the
   provider instead of running out the per-request timeout for every file.
 - `GKVM_TOKEN` environment variable, read by both platforms.
-- GitLab token resolution: `GITLAB_TOKEN`, then `CI_JOB_TOKEN`, then
-  `glab auth token`. A CI job token is sent as `JOB-TOKEN`, which is the only
-  header GitLab accepts it in.
+- GitLab token resolution: `GITLAB_TOKEN`, then `glab auth token`. Tokens are
+  sent as `PRIVATE-TOKEN`, which a live check confirms GitLab validates (an
+  invalid one answers 401 even on a public project).
+  A CI job token is deliberately **not** accepted: GitLab's job token allowlist
+  covers `GET /projects/:id/repository/files/:file_path/raw` but not the
+  repository tree endpoint needed to discover profiles, and GitLab ignores the
+  `JOB-TOKEN` header on routes outside the allowlist rather than rejecting it
+  (confirmed live: an invalid `JOB-TOKEN` still answers 200). A job token would
+  therefore read as anonymous and fail with a 404 that looks like a wrong
+  project. When `CI_JOB_TOKEN` is set and no usable token is found, the
+  provider says exactly this instead of trying.
 
 ### Changed
 

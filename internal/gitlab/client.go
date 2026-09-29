@@ -17,16 +17,18 @@ import (
 // DefaultBaseURL is the REST API endpoint of GitLab.com.
 const DefaultBaseURL = "https://gitlab.com/api/v4"
 
-// PrivateTokenHeader carries personal, group and project access tokens.
+// PrivateTokenHeader carries personal, group and project access tokens. It is
+// the only usable channel here: a CI job token (JOB-TOKEN) reaches the raw file
+// endpoint but not the repository tree endpoint, and GitLab ignores the header
+// on routes outside the job token allowlist rather than rejecting it — so a job
+// token would degrade to anonymous access and fail with a 404 on a private
+// project. The provider says so instead of trying.
 const PrivateTokenHeader = "PRIVATE-TOKEN"
 
-// JobTokenHeader carries a CI job token (CI_JOB_TOKEN). GitLab rejects a job
-// token sent as a private token, so the two cannot share one header.
-const JobTokenHeader = "JOB-TOKEN"
-
-// treePageSize is the maximum page size the GitLab tree endpoint accepts. The
-// endpoint paginates at 20 entries by default, which would silently truncate a
-// profile directory, so every listing is paged explicitly.
+// treePageSize is the page size used for tree listings. The endpoint paginates
+// at 20 by default (confirmed by its x-per-page header), which would silently
+// truncate a profile directory, so every listing is paged explicitly; 100 is
+// GitLab's documented maximum for offset pagination.
 const treePageSize = 100
 
 // maxTreePages bounds the paging loop; 100 pages is 10.000 entries.
@@ -35,8 +37,6 @@ const maxTreePages = 100
 // Client fetches content from a GitLab project.
 type Client struct {
 	Token string
-	// TokenHeader is PrivateTokenHeader (default) or JobTokenHeader.
-	TokenHeader string
 	// Project is the path with namespace, e.g. "group/subgroup/project".
 	Project string
 	Ref     string // branch, tag, or commit SHA
@@ -184,11 +184,7 @@ func (c *Client) FetchFile(ctx context.Context, path string) ([]byte, error) {
 func (c *Client) requester() *source.Requester {
 	headers := map[string]string{}
 	if c.Token != "" {
-		header := c.TokenHeader
-		if header == "" {
-			header = PrivateTokenHeader
-		}
-		headers[header] = c.Token
+		headers[PrivateTokenHeader] = c.Token
 	}
 	return &source.Requester{
 		Platform:   "GitLab",

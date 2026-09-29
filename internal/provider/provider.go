@@ -98,7 +98,8 @@ func (p *GkvmProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp 
 				Optional:  true,
 				Sensitive: true,
 				Description: "Access token with read access to the repository contents. Resolved from " + envToken + ", then platform-specific environment variables, then the platform CLI when unset. " +
-					"GitHub: " + envGHToken + ", " + envGitHubToken + ", then 'gh auth token'. GitLab: " + envGitLabToken + ", " + envCIJobToken + ", then 'glab auth token'.",
+					"GitHub: " + envGHToken + ", " + envGitHubToken + ", then 'gh auth token'. GitLab: " + envGitLabToken + ", then 'glab auth token'. " +
+					"A GitLab CI job token cannot be used — GitLab's job token allowlist does not cover the repository tree endpoint needed to discover profiles.",
 			},
 
 			"github_repo": schema.StringAttribute{
@@ -204,17 +205,16 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 	switch platform {
 	case PlatformGitLab:
 		endpoint = gitlab.NormalizeBaseURL(baseURL)
-		token, header := resolveGitLabToken(ctx, configuredToken, endpoint)
+		token := resolveGitLabToken(ctx, configuredToken, endpoint)
 		if token == "" {
 			resp.Diagnostics.AddError("GitLab token not found", gitlabTokenHelp(endpoint))
 			return
 		}
 		client = &gitlab.Client{
-			Token:       token,
-			TokenHeader: header,
-			Project:     repository,
-			Ref:         ref,
-			BaseURL:     endpoint,
+			Token:   token,
+			Project: repository,
+			Ref:     ref,
+			BaseURL: endpoint,
 		}
 	default:
 		endpoint = github.NormalizeBaseURL(baseURL)
@@ -264,20 +264,20 @@ func resolveGitHubToken(ctx context.Context, configured, endpoint string) string
 	return cliToken(ctx, "gh", github.CLIHost(endpoint))
 }
 
-// resolveGitLabToken returns the first token it can find together with the
-// header it has to be sent in, in order: provider configuration, GKVM_TOKEN,
-// GITLAB_TOKEN, CI_JOB_TOKEN, glab CLI.
+// resolveGitLabToken returns the first token it can find, in order: provider
+// configuration, GKVM_TOKEN, GITLAB_TOKEN, glab CLI.
 //
-// A CI job token is rejected by GitLab when sent as a private token, so it is
-// the one case that changes the header.
-func resolveGitLabToken(ctx context.Context, configured, endpoint string) (token, header string) {
+// CI_JOB_TOKEN is deliberately not in the chain. GitLab's job token allowlist
+// covers GET /projects/:id/repository/files/:file_path/raw but not the
+// repository tree endpoint this provider needs to discover profiles, and on a
+// route outside the allowlist GitLab ignores the JOB-TOKEN header instead of
+// rejecting it. A job token would therefore read as anonymous and fail with a
+// 404 that looks like a wrong project. gitlabTokenHelp names it instead.
+func resolveGitLabToken(ctx context.Context, configured, endpoint string) string {
 	if t := firstNonEmpty(configured, os.Getenv(envToken), os.Getenv(envGitLabToken)); t != "" {
-		return t, gitlab.PrivateTokenHeader
+		return t
 	}
-	if t := os.Getenv(envCIJobToken); t != "" {
-		return t, gitlab.JobTokenHeader
-	}
-	return cliToken(ctx, "glab", gitlab.CLIHost(endpoint)), gitlab.PrivateTokenHeader
+	return cliToken(ctx, "glab", gitlab.CLIHost(endpoint))
 }
 
 // cliToken asks a platform CLI for the stored token of one host. A missing CLI,
@@ -306,9 +306,18 @@ func githubTokenHelp(endpoint string) string {
 }
 
 func gitlabTokenHelp(endpoint string) string {
-	return fmt.Sprintf(
-		"No token found for %s.\nSet token in the provider configuration, set %s / %s / %s, or run 'glab auth login --hostname %s'.\nThe token needs the read_api scope (or read_repository) on the project.",
-		endpoint, envToken, envGitLabToken, envCIJobToken, gitlab.CLIHost(endpoint))
+	help := fmt.Sprintf(
+		"No token found for %s.\nSet token in the provider configuration, set %s / %s, or run 'glab auth login --hostname %s'.\nThe token needs the read_api scope (or read_repository) on the project.",
+		endpoint, envToken, envGitLabToken, gitlab.CLIHost(endpoint))
+
+	// A pipeline is the likeliest place to hit this, and the job token sitting
+	// right there is the likeliest thing to reach for, so say why it cannot work.
+	if os.Getenv(envCIJobToken) != "" {
+		help += fmt.Sprintf(
+			"\n\nA CI job token is present in %s but cannot be used: GitLab's job token allowlist covers the raw file endpoint but not the repository tree endpoint this provider needs to discover the profiles, and GitLab ignores the JOB-TOKEN header on routes outside that allowlist rather than rejecting it — the read would silently fall back to anonymous access. Use a project or group access token with read_api instead.",
+			envCIJobToken)
+	}
+	return help
 }
 
 // coalesce returns the value of the current attribute, falling back to its
