@@ -41,12 +41,20 @@ var _ source.Client = (*Client)(nil)
 //	""                              -> https://api.github.com
 //	https://api.github.com          -> unchanged
 //	https://api.SUBDOMAIN.ghe.com   -> unchanged   (Enterprise Cloud, data residency)
+//	https://SUBDOMAIN.ghe.com       -> https://api.SUBDOMAIN.ghe.com
 //	https://HOSTNAME                -> https://HOSTNAME/api/v3   (Enterprise Server)
 //	https://HOSTNAME/api/v3         -> unchanged
 //
 // Enterprise Cloud publishes the API on an "api." hostname, Enterprise Server
-// under the /api/v3 path of the web host. Anything that already carries a path
-// is left alone, so an unusual deployment or a proxy can be addressed exactly.
+// under the /api/v3 path of the web host. Anything else that already carries a
+// path is left alone, so an unusual deployment or a proxy can be addressed
+// exactly.
+//
+// A ghe.com host is the one case that is corrected rather than taken
+// literally: data residency tenants serve the API only from the "api." form of
+// their subdomain, and the host a user has in hand is the web one they log in
+// to. Appending /api/v3 to it — the Enterprise Server shape — would produce a
+// 404 that reads like a wrong repository.
 func NormalizeBaseURL(raw string) string {
 	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
 	if trimmed == "" {
@@ -57,6 +65,13 @@ func NormalizeBaseURL(raw string) string {
 	if err != nil || u.Host == "" {
 		return trimmed
 	}
+	if isDataResidencyHost(u.Host) {
+		host := u.Host
+		if !strings.HasPrefix(strings.ToLower(host), "api.") {
+			host = "api." + host
+		}
+		return u.Scheme + "://" + host
+	}
 	if u.Path != "" {
 		return trimmed
 	}
@@ -64,6 +79,12 @@ func NormalizeBaseURL(raw string) string {
 		return trimmed
 	}
 	return trimmed + "/api/v3"
+}
+
+// isDataResidencyHost reports whether a host belongs to a GitHub Enterprise
+// Cloud data residency tenant.
+func isDataResidencyHost(host string) bool {
+	return strings.HasSuffix(strings.ToLower(host), ".ghe.com")
 }
 
 // ValidateRepo checks the "owner/repo" form GitHub requires.

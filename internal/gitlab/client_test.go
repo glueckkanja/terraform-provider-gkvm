@@ -165,10 +165,11 @@ func TestListDirectory_ReadsEveryPage(t *testing.T) {
 }
 
 func TestFetchFile_EncodesPathAndStaysOnEndpoint(t *testing.T) {
-	var gotEscapedPath, gotRef, gotHost string
+	var gotEscapedPath, gotRef, gotHost, gotAccept string
 
 	client, server := newMockClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEscapedPath, gotRef, gotHost = r.URL.EscapedPath(), r.URL.Query().Get("ref"), r.Host
+		gotAccept = r.Header.Get("Accept")
 		_, _ = w.Write([]byte("metric_alerts: {}\n"))
 	}))
 
@@ -187,6 +188,10 @@ func TestFetchFile_EncodesPathAndStaysOnEndpoint(t *testing.T) {
 	}
 	if want := strings.TrimPrefix(server.URL, "http://"); gotHost != want {
 		t.Errorf("request host = %q, want %q", gotHost, want)
+	}
+	// The raw endpoint returns file bytes, so the request must not claim JSON.
+	if gotAccept != "*/*" {
+		t.Errorf("Accept = %q, want */*", gotAccept)
 	}
 }
 

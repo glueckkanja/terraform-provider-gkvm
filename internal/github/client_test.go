@@ -18,6 +18,12 @@ func TestNormalizeBaseURL(t *testing.T) {
 		{"github.com unchanged", "https://api.github.com", "https://api.github.com"},
 		{"trailing slash trimmed", "https://api.github.com/", "https://api.github.com"},
 		{"data residency unchanged", "https://api.example.ghe.com", "https://api.example.ghe.com"},
+		// The host a data residency tenant hands out is the web one. Appending
+		// the Enterprise Server path to it would 404.
+		{"data residency web host corrected", "https://example.ghe.com", "https://api.example.ghe.com"},
+		{"data residency trailing slash", "https://example.ghe.com/", "https://api.example.ghe.com"},
+		{"data residency mistaken api/v3 corrected", "https://example.ghe.com/api/v3", "https://api.example.ghe.com"},
+		{"data residency mixed case", "https://Example.GHE.com", "https://api.Example.GHE.com"},
 		{"enterprise server gets api/v3", "https://ghe.example.com", "https://ghe.example.com/api/v3"},
 		{"explicit path kept", "https://ghe.example.com/api/v3", "https://ghe.example.com/api/v3"},
 		{"proxy subpath kept", "https://proxy.example.com/github", "https://proxy.example.com/github"},

@@ -20,11 +20,12 @@ provider "gkvm" {
   # The token needs "contents: read" on the repository.
 }
 
-# GitHub Enterprise Cloud with data residency publishes the API on an "api."
-# hostname under the tenant subdomain:
+# GitHub Enterprise Cloud with data residency publishes the API on the "api."
+# hostname of the tenant subdomain. Either spelling works — the web host is
+# corrected to the API one rather than given the /api/v3 path:
 #
 # provider "gkvm" {
-#   base_url   = "https://api.SUBDOMAIN.ghe.com"
+#   base_url   = "https://api.SUBDOMAIN.ghe.com" # or "https://SUBDOMAIN.ghe.com"
 #   repository = "my-org/gkvm-monitoring-defaults"
 # }
 

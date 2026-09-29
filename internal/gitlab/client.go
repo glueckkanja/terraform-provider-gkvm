@@ -174,7 +174,10 @@ func (c *Client) FetchFile(path string) ([]byte, error) {
 	if path == "" {
 		return nil, fmt.Errorf("empty file path")
 	}
-	return c.requester().Get(c.rawFileURL(path), "application/json")
+	// The raw endpoint answers with file bytes of any type, so the request must
+	// not claim to want JSON; a strict gateway in front of the instance would
+	// answer 406.
+	return c.requester().Get(c.rawFileURL(path), "*/*")
 }
 
 func (c *Client) requester() *source.Requester {

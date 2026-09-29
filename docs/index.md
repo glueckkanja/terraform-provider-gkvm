@@ -26,11 +26,13 @@ provider "gkvm" {
 
 ### GitHub Enterprise Cloud with data residency
 
-The API lives on an `api.` hostname under your `ghe.com` subdomain.
+The API lives on the `api.` hostname of your `ghe.com` subdomain. Either form
+works — a `ghe.com` host given without it is corrected, because the host you
+log in to is the web one.
 
 ```hcl
 provider "gkvm" {
-  base_url   = "https://api.SUBDOMAIN.ghe.com"
+  base_url   = "https://api.SUBDOMAIN.ghe.com" # or "https://SUBDOMAIN.ghe.com"
   repository = "my-org/gkvm-monitoring-defaults"
   ref        = "main"
 }
@@ -78,11 +80,17 @@ provider "gkvm" {
 default applies. Anything that already carries a URL path is used verbatim, so
 an unusual deployment or an API gateway can be addressed exactly.
 
+A `ghe.com` host is the single exception to that rule: data residency tenants
+serve their API only from the `api.` form of the subdomain, so such a host is
+always normalized to it — appending the Enterprise Server `/api/v3` path
+instead would produce a 404 that reads like a wrong repository.
+
 | Deployment | `platform` | `base_url` | Effective endpoint |
 |---|---|---|---|
 | GitHub.com | `github` | *(omit)* | `https://api.github.com` |
 | GitHub Enterprise Cloud | `github` | *(omit)* | `https://api.github.com` |
 | GitHub Enterprise Cloud, data residency | `github` | `https://api.SUBDOMAIN.ghe.com` | as given |
+| GitHub Enterprise Cloud, data residency | `github` | `https://SUBDOMAIN.ghe.com` | `https://api.SUBDOMAIN.ghe.com` |
 | GitHub Enterprise Server | `github` | `https://HOSTNAME` | `https://HOSTNAME/api/v3` |
 | GitLab.com | `gitlab` | *(omit)* | `https://gitlab.com/api/v4` |
 | GitLab self-managed / dedicated | `gitlab` | `https://HOSTNAME` | `https://HOSTNAME/api/v4` |

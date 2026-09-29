@@ -18,7 +18,10 @@ names are deprecated, not removed.
   `platform`, and falls back to the `GKVM_BASE_URL` environment variable.
   A bare hostname is completed with the platform's API path (`/api/v3` for
   GitHub Enterprise Server, `/api/v4` for GitLab), while an endpoint that
-  already carries a path is used verbatim. HTTPS is required.
+  already carries a path is used verbatim. A `ghe.com` host is the one
+  exception and is always normalized to `https://api.SUBDOMAIN.ghe.com`:
+  data residency tenants serve the API only from that form, and the host a
+  user has in hand is the web one they log in to. HTTPS is required.
 - `platform` — `github` (default) or `gitlab`.
 - GitLab backend: project paths with nested subgroups, tree listings paged
   explicitly at 100 entries (the endpoint defaults to 20, which would silently
@@ -42,6 +45,9 @@ names are deprecated, not removed.
   host was used, so a CLI logged into an Enterprise host handed out a token
   that `api.github.com` then rejected with a misleading 401.
 - Error messages name the endpoint, the repository and the ref.
+- The GitLab raw file request asks for `*/*` instead of `application/json`.
+  The endpoint answers with file bytes of any type, so a gateway in front of a
+  self-managed instance could have answered 406.
 
 ### Fixed
 
