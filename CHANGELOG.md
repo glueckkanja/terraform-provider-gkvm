@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Transient API failures are retried instead of failing the read. A single
+  HTTP 5xx or 429 from the configured endpoint used to abort the data source,
+  and because every consumer reads the profiles, one blip anywhere turned a
+  whole plan or apply red with `Failed to fetch monitoring profiles`. Reads now
+  make up to five attempts with an exponential backoff (500 ms doubling to a
+  4 s cap), honour a bounded `Retry-After` on 429 and 503, and stop as soon as
+  the context ends.
+
+  Permanent answers are still reported on the first attempt: 401, 403, 404 and
+  any other 4xx are never retried, nor is a redirect that leaves the configured
+  endpoint, an oversized response, or a request that was refused up front. The
+  error messages are unchanged, so an exhausted retry reports the last status
+  exactly as before. The retry lives in the shared requester, so it applies to
+  both the GitHub and GitLab backends.
+
 ## [0.2.0] — Configurable endpoint and GitLab support
 
 ### Overview

@@ -6,8 +6,18 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// fastRetries keeps the retry tests quick without changing the logic.
+func fastRetries(t *testing.T) {
+	t.Helper()
+	base, max := retryBaseDelay, retryMaxDelay
+	retryBaseDelay, retryMaxDelay = time.Millisecond, 2*time.Millisecond
+	t.Cleanup(func() { retryBaseDelay, retryMaxDelay = base, max })
+}
 
 func TestValidateBaseURL(t *testing.T) {
 	tests := []struct {
@@ -273,6 +283,7 @@ func TestGet_RejectsOversizedResponse(t *testing.T) {
 // exactly what is wrong. Flattening that into "connection error" sent the user
 // looking at their token instead.
 func TestGet_ReportsTheTransportCauseWithoutTheURL(t *testing.T) {
+	fastRetries(t)
 	// A server that is closed immediately leaves a port nothing listens on.
 	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	client := closed.Client()
@@ -384,6 +395,7 @@ func TestGet_RefusesForeignHost(t *testing.T) {
 }
 
 func TestGet_HTTPErrorsAndTokenSafety(t *testing.T) {
+	fastRetries(t)
 	tests := []struct {
 		name       string
 		statusCode int
@@ -413,5 +425,106 @@ func TestGet_HTTPErrorsAndTokenSafety(t *testing.T) {
 				t.Errorf("credential leaked in error message: %v", err)
 			}
 		})
+	}
+}
+
+func TestGet_RetriesServerErrorsThenSucceeds(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) < 3 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte("payload"))
+	}))
+
+	body, err := r.Get(context.Background(), r.Base()+"/anything", "application/json")
+	if err != nil {
+		t.Fatalf("expected success after retries, got %v", err)
+	}
+	if string(body) != "payload" {
+		t.Errorf("body = %q, want %q", body, "payload")
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("calls = %d, want 3", got)
+	}
+}
+
+func TestGet_DoesNotRetryPermanentStatuses(t *testing.T) {
+	fastRetries(t)
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+		var calls atomic.Int32
+		r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls.Add(1)
+			http.Error(w, "nope", status)
+		}))
+		if _, err := r.Get(context.Background(), r.Base()+"/anything", "application/json"); err == nil {
+			t.Fatalf("status %d: expected error", status)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Errorf("status %d: calls = %d, want 1", status, got)
+		}
+	}
+}
+
+func TestGet_RetriesThrottlingAndHonoursRetryAfter(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	if _, err := r.Get(context.Background(), r.Base()+"/anything", "application/json"); err != nil {
+		t.Fatalf("expected success after throttling, got %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("calls = %d, want 2", got)
+	}
+}
+
+func TestGet_GivesUpAfterMaxAttempts(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "boom", http.StatusBadGateway)
+	}))
+
+	_, err := r.Get(context.Background(), r.Base()+"/anything", "application/json")
+	if err == nil || !strings.Contains(err.Error(), "502") {
+		t.Fatalf("expected the last 502 to be reported, got %v", err)
+	}
+	if got := calls.Load(); int(got) != maxAttempts {
+		t.Errorf("calls = %d, want %d", got, maxAttempts)
+	}
+}
+
+func TestGet_RetryStopsOnCancelledContext(t *testing.T) {
+	retryBaseDelay, retryMaxDelay = time.Hour, time.Hour
+	t.Cleanup(func() { retryBaseDelay, retryMaxDelay = 500*time.Millisecond, 4*time.Second })
+	var calls atomic.Int32
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "boom", http.StatusServiceUnavailable)
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for calls.Load() == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+	if _, err := r.Get(ctx, r.Base()+"/anything", "application/json"); err == nil {
+		t.Fatal("expected a cancellation error")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("calls = %d, want 1 (the backoff must not outlive the context)", got)
 	}
 }

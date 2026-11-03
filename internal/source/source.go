@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,6 +22,20 @@ const MaxResponseBytes = 10 * 1024 * 1024
 
 // maxRedirects bounds a same-host redirect chain.
 const maxRedirects = 5
+
+// Retry bounds for transient failures. A single 5xx from the API used to fail a
+// whole plan: every unit reads the profiles, so one blip anywhere turned the run
+// red. Permanent answers (4xx other than 429) are never retried.
+const (
+	maxAttempts     = 5
+	retryAfterLimit = 10 * time.Second
+)
+
+// Delays are variables so tests can shrink them; production never changes them.
+var (
+	retryBaseDelay = 500 * time.Millisecond
+	retryMaxDelay  = 4 * time.Second
+)
 
 // sharedHTTPClient is used by every backend unless a test injects its own.
 var sharedHTTPClient = &http.Client{
@@ -237,20 +252,74 @@ func (r *Requester) onEndpoint(rawURL string) bool {
 	return strings.EqualFold(u.Scheme, base.Scheme) && strings.EqualFold(u.Host, base.Host)
 }
 
-// Get fetches a URL on the configured endpoint and returns the response body.
+// Get fetches a URL on the configured endpoint and returns the response body,
+// retrying transient failures with a bounded backoff.
 func (r *Requester) Get(ctx context.Context, requestURL, accept string) ([]byte, error) {
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		body, delay, retryable, err := r.get(ctx, requestURL, accept, attempt)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if !retryable || attempt == maxAttempts {
+			break
+		}
+		if err := sleep(ctx, delay); err != nil {
+			return nil, fmt.Errorf("%s API request to %s for %s was cancelled: %w", r.Platform, r.Base(), r.Subject, err)
+		}
+	}
+	return nil, lastErr
+}
+
+// sleep waits for d unless the context ends first.
+func sleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// backoff returns the wait before the given attempt's retry.
+func backoff(attempt int) time.Duration {
+	delay := retryBaseDelay << (attempt - 1)
+	if delay > retryMaxDelay {
+		return retryMaxDelay
+	}
+	return delay
+}
+
+// retryAfter reads a Retry-After delay in seconds, bounded, else falls back to
+// the backoff for this attempt.
+func retryAfter(header string, attempt int) time.Duration {
+	if seconds, err := strconv.Atoi(strings.TrimSpace(header)); err == nil && seconds >= 0 {
+		if d := time.Duration(seconds) * time.Second; d <= retryAfterLimit {
+			return d
+		}
+		return retryAfterLimit
+	}
+	return backoff(attempt)
+}
+
+// get performs one request. It reports whether the failure is worth retrying
+// and, if so, how long to wait first.
+func (r *Requester) get(ctx context.Context, requestURL, accept string, attempt int) ([]byte, time.Duration, bool, error) {
 	// Security: every request must stay on the configured endpoint. Request
 	// URLs are built by the backends themselves, so this cannot fail today; it
 	// is defence in depth against a future code path that takes a URL from an
 	// API response, which a compromised deployment or a MITM could point at an
 	// internal address (SSRF) or at a host that would collect the credentials.
 	if !r.onEndpoint(requestURL) {
-		return nil, fmt.Errorf("refusing to request %q: not the configured endpoint %s", requestURL, r.Base())
+		return nil, 0, false, fmt.Errorf("refusing to request %q: not the configured endpoint %s", requestURL, r.Base())
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, 0, false, fmt.Errorf("creating request: %w", err)
 	}
 
 	req.Header.Set("Accept", accept)
@@ -263,11 +332,11 @@ func (r *Requester) Get(ctx context.Context, requestURL, accept string) ([]byte,
 		// A refused redirect is a distinct, actionable condition and must not be
 		// flattened into the generic connection error below.
 		if errors.Is(err, errOffEndpoint) {
-			return nil, fmt.Errorf("%s API request for %s was redirected away from the configured endpoint %s and was refused: %w",
+			return nil, 0, false, fmt.Errorf("%s API request for %s was redirected away from the configured endpoint %s and was refused: %w",
 				r.Platform, r.Subject, r.Base(), err)
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, fmt.Errorf("%s API request to %s for %s was cancelled: %w", r.Platform, r.Base(), r.Subject, ctxErr)
+			return nil, 0, false, fmt.Errorf("%s API request to %s for %s was cancelled: %w", r.Platform, r.Base(), r.Subject, ctxErr)
 		}
 		// Report the transport cause but not the request URL. net/http wraps
 		// every failure in a *url.Error that repeats the URL; the cause inside
@@ -279,7 +348,8 @@ func (r *Requester) Get(ctx context.Context, requestURL, accept string) ([]byte,
 		if errors.As(err, &urlErr) && urlErr.Err != nil {
 			cause = urlErr.Err
 		}
-		return nil, fmt.Errorf("%s API request to %s for %s failed: %v (check network, endpoint and token validity)",
+		// A transport failure is usually transient (reset connection, DNS blip).
+		return nil, backoff(attempt), true, fmt.Errorf("%s API request to %s for %s failed: %v (check network, endpoint and token validity)",
 			r.Platform, r.Base(), r.Subject, cause)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -290,10 +360,10 @@ func (r *Requester) Get(ctx context.Context, requestURL, accept string) ([]byte,
 	// alert rules fell off the end.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("reading response for %s: %w", r.Subject, err)
+		return nil, backoff(attempt), true, fmt.Errorf("reading response for %s: %w", r.Subject, err)
 	}
 	if len(body) > MaxResponseBytes {
-		return nil, fmt.Errorf("response for %s from %s exceeds the %d byte limit and was not read",
+		return nil, 0, false, fmt.Errorf("response for %s from %s exceeds the %d byte limit and was not read",
 			r.Subject, r.Base(), MaxResponseBytes)
 	}
 
@@ -309,9 +379,15 @@ func (r *Requester) Get(ctx context.Context, requestURL, accept string) ([]byte,
 		case http.StatusNotFound:
 			hint = " (check that the endpoint, repository, ref, and path exist — a token without read access also reports 404)"
 		}
-		return nil, fmt.Errorf("%s API at %s returned HTTP %d for %s%s",
+		// 5xx is the server failing, 429 is throttling: both are worth another go.
+		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		delay := time.Duration(0)
+		if retryable {
+			delay = retryAfter(resp.Header.Get("Retry-After"), attempt)
+		}
+		return nil, delay, retryable, fmt.Errorf("%s API at %s returned HTTP %d for %s%s",
 			r.Platform, r.Base(), resp.StatusCode, r.Subject, hint)
 	}
 
-	return body, nil
+	return body, 0, false, nil
 }
