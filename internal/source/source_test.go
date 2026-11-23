@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -911,4 +912,69 @@ func TestProbeWaitBudget_CoversABurstButNotALimit(t *testing.T) {
 	if ProbeWaitBudget >= ReadWaitBudget {
 		t.Errorf("ProbeWaitBudget %v is not smaller than ReadWaitBudget %v", ProbeWaitBudget, ReadWaitBudget)
 	}
+}
+
+// The read budget is shared by requests that run concurrently — a profile read
+// of many files does exactly that — so the bound has to hold across them.
+func TestRateLimitBudget_HoldsUnderConcurrency(t *testing.T) {
+	const (
+		readers = 20
+		share   = 100 * time.Millisecond
+	)
+	// Room for exactly five shares, asked for by twenty readers at once.
+	ctx := WithRateLimitBudget(context.Background(), 5*share)
+
+	var granted atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if takeWait(ctx, share).fits {
+				granted.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := granted.Load(); got != 5 {
+		t.Errorf("granted = %d, want exactly 5 — the budget was over- or under-spent", got)
+	}
+	if takeWait(ctx, time.Nanosecond).fits {
+		t.Error("a wait fit a budget that twenty readers had just emptied")
+	}
+}
+
+// Concurrent Gets sharing one budget must not each sleep the bound. This is the
+// shape of a profile read: many requests, one limit.
+func TestGet_ConcurrentReadsShareOneBudget(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+
+	// Two seconds for the whole read, whatever the ten readers ask for.
+	ctx := WithRateLimitBudget(context.Background(), 2*time.Second)
+	start := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = r.Get(ctx, r.Base()+"/anything", "application/json")
+		}()
+	}
+	wg.Wait()
+
+	// Ten readers each honouring a 1 s Retry-After four times would be 40 s.
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("read took %v; the shared budget did not bound it", elapsed)
+	}
+	t.Logf("10 concurrent readers, %d requests, %v elapsed", calls.Load(), time.Since(start).Round(time.Millisecond))
 }

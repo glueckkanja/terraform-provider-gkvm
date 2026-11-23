@@ -43,8 +43,14 @@ jobs:
           version: v2.13.2
 
   test:
-    name: Build and test
-    runs-on: ubuntu-latest
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The local backend is filesystem code — path separators, symlink
+        # semantics and file kinds differ — and the provider ships for both.
+        os: [ubuntu-latest, windows-latest]
     permissions:
       contents: read
     steps:
@@ -64,6 +70,7 @@ jobs:
         run: go test -race -count=1 -coverprofile=coverage.out ./...
 
       - name: Check coverage threshold
+        if: matrix.os == 'ubuntu-latest'
         run: |
           COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | tr -d '%')
           echo "Total coverage: ${COVERAGE}%"
@@ -73,6 +80,7 @@ jobs:
           fi
 
       - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage
