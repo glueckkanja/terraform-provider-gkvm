@@ -108,7 +108,9 @@ func configure(t *testing.T, attrs map[string]string) *provider.ConfigureRespons
 func configureCtx(t *testing.T, ctx context.Context, attrs map[string]string) *provider.ConfigureResponse {
 	t.Helper()
 	t.Setenv(envToken, "dummy-token")
-	t.Setenv(envBaseURL, "")
+	if os.Getenv(envBaseURL) == "" {
+		t.Setenv(envBaseURL, "")
+	}
 
 	s := providerSchema(t)
 	objType, ok := s.Type().TerraformType(context.Background()).(tftypes.Object)
@@ -517,5 +519,39 @@ func TestConfigure_LocalWarningNamesOnlyWhatIsSet(t *testing.T) {
 	}
 	if strings.Contains(detail, ", token") || strings.HasPrefix(detail, "token") {
 		t.Errorf("warning %q names token, which was never set", detail)
+	}
+}
+
+// A trailing newline from `echo "X=$dir" >> $GITHUB_ENV` must not select the
+// backend and then fail on a character nobody can see in the diagnostic.
+func TestConfigure_LocalDirIsTrimmed(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(envLocalDir, dir+"\n")
+
+	resp := configureCtx(t, bounded(t), map[string]string{
+		"repository": "owner/repo",
+		"base_url":   unreachable,
+	})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("a trailing newline broke the directory: %s", diagnostics(resp))
+	}
+}
+
+// base_url resolved from the environment is not an attribute anyone can
+// remove, so naming it in the "remove them" warning would misdirect.
+func TestConfigure_LocalWarningIgnoresEnvironmentEndpoint(t *testing.T) {
+	t.Setenv(envBaseURL, "https://ghe.example.com")
+
+	resp := configure(t, map[string]string{
+		"platform":  "local",
+		"local_dir": t.TempDir(),
+	})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("expected no error, got %s", diagnostics(resp))
+	}
+	for _, w := range resp.Diagnostics.Warnings() {
+		if strings.Contains(w.Detail(), "base_url") {
+			t.Errorf("warning %q names base_url, which came from the environment", w.Detail())
+		}
 	}
 }

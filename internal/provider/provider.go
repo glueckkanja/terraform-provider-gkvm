@@ -141,7 +141,9 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 	}
 
 	platform := strings.ToLower(strings.TrimSpace(stringValue(config.Platform)))
-	localDir := firstNonEmpty(stringValue(config.LocalDir), os.Getenv(envLocalDir))
+	// Trimmed: a trailing newline from `echo "X=$dir" >> $GITHUB_ENV` would
+	// otherwise select this backend and then fail on an invisible character.
+	localDir := strings.TrimSpace(firstNonEmpty(stringValue(config.LocalDir), os.Getenv(envLocalDir)))
 
 	// The environment selects the local backend on its own, so a CI job can
 	// switch a generated configuration it cannot edit. An explicit platform wins.
@@ -238,7 +240,7 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		// No token is resolved: nothing here reaches the network, and the
 		// platform CLI would otherwise be run once per reader for nothing.
 		warnIgnoredByLocal(resp, map[string]string{
-			"base_url":     baseURL,
+			"base_url":     stringValue(config.BaseURL),
 			"token":        stringValue(config.Token),
 			"github_token": stringValue(config.GithubToken),
 		})
@@ -280,8 +282,10 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		return
 	}
 
-	// Validate reachability with a lightweight repository check (fail-fast).
-	if err := client.Ping(ctx); err != nil {
+	// The probe gets no waiting budget: it only answers "is this reachable",
+	// and one provider instance per unit each sleeping out a limit here turns
+	// a fast red into an hour of waiting.
+	if err := client.Ping(source.WithRateLimitBudget(ctx, 0)); err != nil {
 		title := "Failed to connect to the repository"
 		if platform == PlatformLocal {
 			title = "Failed to read the local profile directory"

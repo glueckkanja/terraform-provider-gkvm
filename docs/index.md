@@ -9,7 +9,7 @@ description: |-
 The GKVM provider reads content from a Git repository and exposes it as
 Terraform data sources, starting with monitoring alert profiles.
 
-It talks to the REST API of the repository platform. Both supported platforms
+It talks to the REST API of the repository platform. Both API platforms
 work in every deployment shape — public SaaS, enterprise tenant, or a server
 your own organization runs — because the endpoint is configurable.
 
@@ -189,7 +189,9 @@ them against the directory — pin the ref in whatever fetches it.
 Failures are loud by design: a directory that is missing, is not a directory,
 or cannot be listed is reported when the provider is configured, and one that
 holds no YAML profile is reported when it is read. An empty profile set would
-otherwise become a plan that silently drops every default alert.
+otherwise become a plan that silently drops every default alert. A path inside
+the directory that is not a regular file, or that resolves outside it, is
+refused by name.
 
 ## Network requirements
 
@@ -223,10 +225,12 @@ Rename them when convenient:
 | `github_token` | `token` |
 
 Setting both spellings to different values is an error, and so is setting any
-`github_*` attribute while `platform` is not `github` — a `github_token` left
-behind during a migration would otherwise be sent to the GitLab host. A
-configuration that only sets the old names keeps reading GitHub.com exactly as
-before.
+`github_*` attribute while `platform` is `gitlab` — a `github_token` left
+behind during a migration would otherwise be sent to the GitLab host. Under
+`platform = "local"` they are only reported as ignored, because nothing is sent
+anywhere and that platform is normally reached from a configuration written for
+the API. A configuration that only sets the old names keeps reading GitHub.com
+exactly as before.
 
 ## Schema
 

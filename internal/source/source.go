@@ -44,6 +44,7 @@ const ReadWaitBudget = rateLimitWaitLimit
 // shared, so a read of many files cannot spend the bound once per request.
 type budget struct {
 	mu        sync.Mutex
+	total     time.Duration
 	remaining time.Duration
 }
 
@@ -52,22 +53,33 @@ type budgetKey struct{}
 // WithRateLimitBudget gives every request made under ctx one shared waiting
 // budget. A read of many files needs this; a single request gets its own.
 func WithRateLimitBudget(ctx context.Context, total time.Duration) context.Context {
-	return context.WithValue(ctx, budgetKey{}, &budget{remaining: total})
+	return context.WithValue(ctx, budgetKey{}, &budget{total: total, remaining: total})
 }
 
-// takeWait reserves a wait from the budget in ctx and reports whether it fit.
-func takeWait(ctx context.Context, d time.Duration) bool {
+// waiting is the outcome of asking a budget to cover one wait. The three
+// refusals are different things to act on: a budget that never allowed any
+// waiting, one spent by earlier requests, and a limit simply too long.
+type waiting struct {
+	fits      bool
+	available time.Duration
+	total     time.Duration
+}
+
+// takeWait reserves a wait from the budget in ctx.
+func takeWait(ctx context.Context, d time.Duration) waiting {
 	b, ok := ctx.Value(budgetKey{}).(*budget)
 	if !ok {
-		return d <= rateLimitWaitLimit
+		return waiting{fits: d <= rateLimitWaitLimit, available: rateLimitWaitLimit, total: rateLimitWaitLimit}
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	state := waiting{available: b.remaining, total: b.total}
 	if d > b.remaining {
-		return false
+		return state
 	}
 	b.remaining -= d
-	return true
+	state.fits = true
+	return state
 }
 
 // Delays are variables so tests can shrink them; production never changes them.
@@ -487,12 +499,22 @@ func (r *Requester) get(ctx context.Context, requestURL, accept string, attempt 
 
 		// Throttling first: it is the one condition a status code alone
 		// cannot name, because 403 serves double duty.
-		switch t := classifyThrottle(resp.StatusCode, resp.Header, attempt); {
+		t := classifyThrottle(resp.StatusCode, resp.Header, attempt)
+		var wait waiting
+		if t.limited {
+			wait = takeWait(ctx, t.wait)
+		}
+		switch {
 		case t.limited && attempt == maxAttempts:
-			hint = fmt.Sprintf(" (rate limited; gave up after %d attempts)", maxAttempts)
-		case t.limited && !takeWait(ctx, t.wait):
-			hint = fmt.Sprintf(" (rate limited and the limit does not lift for %s, more than this read may wait — spread the reads out, bundle them, or use a token with a higher limit)",
-				t.wait.Round(time.Second))
+			hint = fmt.Sprintf(" (rate limited for %s; gave up after %d attempts)",
+				t.wait.Round(time.Second), maxAttempts)
+		case t.limited && wait.total <= 0:
+			hint = fmt.Sprintf(" (rate limited for %s; this check does not wait a limit out)", t.wait.Round(time.Second))
+		case t.limited && wait.available <= 0:
+			hint = " (rate limited, and this read has already spent its waiting budget on earlier requests — bundle the content or use a token with a higher limit)"
+		case t.limited && !wait.fits:
+			hint = fmt.Sprintf(" (rate limited and the limit does not lift for %s, more than the %s this read may still wait — spread the reads out, bundle them, or use a token with a higher limit)",
+				t.wait.Round(time.Second), wait.available.Round(time.Second))
 		case t.limited:
 			hint = fmt.Sprintf(" (rate limited; waiting %s before attempt %d of %d)",
 				t.wait.Round(time.Millisecond), attempt+1, maxAttempts)

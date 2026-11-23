@@ -75,8 +75,18 @@
   platform already emitted for `base_url` and `token`. Silently reading the API
   is the failure mode this backend exists to remove.
 
+- `local_dir` and `GKVM_LOCAL_DIR` are trimmed. A trailing newline — what
+  `echo "X=$dir" >> $GITHUB_ENV` produces — selected the local platform and
+  then failed on a character invisible in the diagnostic.
+
+- The reachability check made when the provider is configured no longer waits
+  out a rate limit. It runs once per provider instance, so one per unit each
+  sleeping through a limit turned a fast failure into a long one, and the check
+  only answers whether the endpoint is reachable.
+
 - The warning about attributes the local platform ignores names only the
-  attributes that were set. `token` and `github_token` are one value after
+  attributes that were set, and only those from the configuration — an endpoint
+  resolved from `GKVM_BASE_URL` is not something the reader can remove. `token` and `github_token` are one value after
   coalescing, so a configuration setting just the deprecated spelling was told
   to remove an attribute it never had.
 

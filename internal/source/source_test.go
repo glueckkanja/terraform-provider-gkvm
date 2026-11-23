@@ -740,16 +740,21 @@ func TestGet_RateLimited403DoesNotBlameTheToken(t *testing.T) {
 func TestRateLimitBudget_IsSharedAcrossRequests(t *testing.T) {
 	ctx := WithRateLimitBudget(context.Background(), 10*time.Second)
 
-	if !takeWait(ctx, 6*time.Second) {
+	if !takeWait(ctx, 6*time.Second).fits {
 		t.Fatal("first wait did not fit an empty budget")
 	}
-	if takeWait(ctx, 6*time.Second) {
+	state := takeWait(ctx, 6*time.Second)
+	if state.fits {
 		t.Error("second wait fit a budget with 4s left")
 	}
-	if !takeWait(ctx, 4*time.Second) {
+	// The remainder is reported so a refusal can say which reason applied.
+	if state.available != 4*time.Second {
+		t.Errorf("available = %v, want 4s", state.available)
+	}
+	if !takeWait(ctx, 4*time.Second).fits {
 		t.Error("a wait matching the remainder was refused")
 	}
-	if takeWait(ctx, time.Millisecond) {
+	if takeWait(ctx, time.Millisecond).fits {
 		t.Error("a wait fit an exhausted budget")
 	}
 }
@@ -758,10 +763,10 @@ func TestRateLimitBudget_FallsBackToThePerRequestCap(t *testing.T) {
 	// Without a budget in the context — a Ping, say — the per-attempt cap
 	// applies so a lone request is still bounded.
 	ctx := context.Background()
-	if !takeWait(ctx, rateLimitWaitLimit) {
+	if !takeWait(ctx, rateLimitWaitLimit).fits {
 		t.Error("a wait at the cap was refused")
 	}
-	if takeWait(ctx, rateLimitWaitLimit+time.Second) {
+	if takeWait(ctx, rateLimitWaitLimit+time.Second).fits {
 		t.Error("a wait past the cap was allowed")
 	}
 }
@@ -790,8 +795,9 @@ func TestGet_StopsRetryingWhenTheReadBudgetIsSpent(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Errorf("read took %v, which is not bounded by the budget", elapsed)
 	}
-	if !strings.Contains(err.Error(), "more than this read may wait") {
-		t.Errorf("error %q does not say the budget is spent", err)
+	// 2 s was taken, 1 s is left, so the refusal names both numbers.
+	if !strings.Contains(err.Error(), "more than the 1s this read may still wait") {
+		t.Errorf("error %q does not say how much budget is left", err)
 	}
 }
 
@@ -812,5 +818,58 @@ func TestGet_FinalRateLimitErrorDoesNotPromiseARetry(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "attempt 6") {
 		t.Errorf("error %q promises an attempt that never happens", err)
+	}
+}
+
+// A budget spent to the last second is a different thing to act on than a
+// limit that is simply too long, so the two refusals read differently.
+func TestGet_SaysWhenTheBudgetIsFullySpent(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+
+	// Exactly one 2 s wait fits; the next request finds nothing left.
+	ctx := WithRateLimitBudget(context.Background(), 2*time.Second)
+	_, err := r.Get(ctx, r.Base()+"/anything", "application/json")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("calls = %d, want 2", got)
+	}
+	if !strings.Contains(err.Error(), "already spent its waiting budget") {
+		t.Errorf("error %q does not say the budget is spent", err)
+	}
+}
+
+// The reachability probe runs once per provider instance, which is once per
+// unit, so it must never sleep out a limit: it only answers "reachable".
+func TestGet_AProbeWithNoBudgetFailsAtOnce(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "20")
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+
+	ctx := WithRateLimitBudget(context.Background(), 0)
+	_, err := r.Get(ctx, r.Base()+"/anything", "application/json")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("calls = %d, want 1", got)
+	}
+	if !strings.Contains(err.Error(), "does not wait a limit out") {
+		t.Errorf("error %q does not explain that this check never waits", err)
+	}
+	// It must not claim an earlier request spent the budget: there was none.
+	if strings.Contains(err.Error(), "already spent") {
+		t.Errorf("error %q blames requests that never happened", err)
 	}
 }
