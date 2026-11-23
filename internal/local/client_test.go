@@ -121,6 +121,12 @@ func TestClient_IdentityForErrorMessages(t *testing.T) {
 	}
 }
 
+// absDir returns an absolute directory path valid on every platform.
+func absDir(t *testing.T) string {
+	t.Helper()
+	return t.TempDir()
+}
+
 func TestClient_RejectsBadConfiguration(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -130,7 +136,10 @@ func TestClient_RejectsBadConfiguration(t *testing.T) {
 		{"empty directory", &Client{Dir: ""}, "must not be empty"},
 		{"blank directory", &Client{Dir: "   "}, "must not be empty"},
 		{"relative directory", &Client{Dir: filepath.Join("relative", "path")}, "absolute path"},
-		{"ref with a query separator", &Client{Dir: string(filepath.Separator) + "tmp", Ref: "main?x=1"}, "invalid ref"},
+		// t.TempDir is absolute on every platform: a rooted path without a
+		// volume ("\\tmp") is not absolute on Windows and would fail the
+		// check above instead of reaching the ref.
+		{"ref with a query separator", &Client{Dir: absDir(t), Ref: "main?x=1"}, "invalid ref"},
 	}
 
 	for _, tt := range tests {
@@ -273,7 +282,7 @@ func TestClient_EnforcesTheSizeCap(t *testing.T) {
 }
 
 func TestClient_SatisfiesTheSourceInterface(t *testing.T) {
-	var c source.Client = &Client{Dir: string(filepath.Separator) + "tmp"}
+	var c source.Client = &Client{Dir: absDir(t)}
 	if c.Reference() != "" {
 		t.Errorf("Reference() = %q, want empty", c.Reference())
 	}
