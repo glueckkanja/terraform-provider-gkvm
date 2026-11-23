@@ -549,7 +549,6 @@ func TestClassifyThrottle(t *testing.T) {
 		status      int
 		header      http.Header
 		wantLimited bool
-		wantBeyond  bool
 		wantWait    time.Duration // checked only when exact
 		exactWait   bool
 	}{
@@ -618,20 +617,17 @@ func TestClassifyThrottle(t *testing.T) {
 			header:      header(map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": strconv.FormatInt(soon, 10)}),
 			wantLimited: true,
 		},
-		// Five attempts cannot outlast a 45-minute window.
 		{
-			name:        "a reset beyond the bound is reported, not retried",
+			name:        "a reset far out is still throttling",
 			status:      http.StatusTooManyRequests,
 			header:      header(map[string]string{"X-RateLimit-Reset": strconv.FormatInt(late, 10)}),
 			wantLimited: true,
-			wantBeyond:  true,
 		},
 		{
-			name:        "a Retry-After beyond the bound is reported, not retried",
+			name:        "a long Retry-After is reported verbatim",
 			status:      http.StatusForbidden,
 			header:      header(map[string]string{"Retry-After": "600"}),
 			wantLimited: true,
-			wantBeyond:  true,
 			wantWait:    600 * time.Second,
 			exactWait:   true,
 		},
@@ -650,9 +646,6 @@ func TestClassifyThrottle(t *testing.T) {
 			got := classifyThrottle(tt.status, tt.header, 1)
 			if got.limited != tt.wantLimited {
 				t.Errorf("limited = %v, want %v", got.limited, tt.wantLimited)
-			}
-			if got.beyond != tt.wantBeyond {
-				t.Errorf("beyond = %v, want %v", got.beyond, tt.wantBeyond)
 			}
 			if tt.exactWait && got.wait != tt.wantWait {
 				t.Errorf("wait = %v, want %v", got.wait, tt.wantWait)
@@ -739,5 +732,85 @@ func TestGet_RateLimited403DoesNotBlameTheToken(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "rate limited") {
 		t.Errorf("permission 403 error %q claims a rate limit", err)
+	}
+}
+
+// The budget belongs to the read, not to the request: before this it was a
+// per-attempt cap, so a read of 36 files could wait out the cap 36 times.
+func TestRateLimitBudget_IsSharedAcrossRequests(t *testing.T) {
+	ctx := WithRateLimitBudget(context.Background(), 10*time.Second)
+
+	if !takeWait(ctx, 6*time.Second) {
+		t.Fatal("first wait did not fit an empty budget")
+	}
+	if takeWait(ctx, 6*time.Second) {
+		t.Error("second wait fit a budget with 4s left")
+	}
+	if !takeWait(ctx, 4*time.Second) {
+		t.Error("a wait matching the remainder was refused")
+	}
+	if takeWait(ctx, time.Millisecond) {
+		t.Error("a wait fit an exhausted budget")
+	}
+}
+
+func TestRateLimitBudget_FallsBackToThePerRequestCap(t *testing.T) {
+	// Without a budget in the context — a Ping, say — the per-attempt cap
+	// applies so a lone request is still bounded.
+	ctx := context.Background()
+	if !takeWait(ctx, rateLimitWaitLimit) {
+		t.Error("a wait at the cap was refused")
+	}
+	if takeWait(ctx, rateLimitWaitLimit+time.Second) {
+		t.Error("a wait past the cap was allowed")
+	}
+}
+
+// A read is bounded as a whole: once the budget is gone the next throttled
+// request is reported rather than waited out.
+func TestGet_StopsRetryingWhenTheReadBudgetIsSpent(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+
+	// Three seconds covers one 2 s wait and no more.
+	ctx := WithRateLimitBudget(context.Background(), 3*time.Second)
+	start := time.Now()
+	_, err := r.Get(ctx, r.Base()+"/anything", "application/json")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("calls = %d, want 2 (one retry, then the budget is spent)", got)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("read took %v, which is not bounded by the budget", elapsed)
+	}
+	if !strings.Contains(err.Error(), "more than this read may wait") {
+		t.Errorf("error %q does not say the budget is spent", err)
+	}
+}
+
+// The last attempt must not promise a sixth one.
+func TestGet_FinalRateLimitErrorDoesNotPromiseARetry(t *testing.T) {
+	fastRetries(t)
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		http.Error(w, "secondary rate limit", http.StatusForbidden)
+	}))
+
+	_, err := r.Get(context.Background(), r.Base()+"/anything", "application/json")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "gave up after 5 attempts") {
+		t.Errorf("error %q does not say it gave up", err)
+	}
+	if strings.Contains(err.Error(), "attempt 6") {
+		t.Errorf("error %q promises an attempt that never happens", err)
 	}
 }

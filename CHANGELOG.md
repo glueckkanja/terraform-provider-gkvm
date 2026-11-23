@@ -52,9 +52,33 @@
 - A rate limit that outlasts the read is reported instead of retried. A limit
   asking for half an hour cannot be waited out in five attempts, so the read
   now says how long it lasts rather than spending its attempts to fail
-  anyway. Waits up to 90 seconds are honoured — more than the 10 second cap
-  applied to a 5xx, because a limit lifts only when its window moves while a
-  server error may be gone on the next try.
+  anyway.
+
+  The budget is the read's, not each request's: one profile read makes a
+  listing plus one request per file, and each of those waiting out the bound
+  separately would turn a throttled plan into minutes of sleeping. 90 seconds
+  covers a whole read — more than the 10 second cap applied to a 5xx, because
+  a limit lifts only when its window moves while a server error may be gone on
+  the next try. A request outside a read gets its own budget of the same size.
+
+- A non-regular file in a local profile directory is refused by name instead of
+  blocking the read. The kind is checked before the file is opened, because
+  opening a FIFO blocks until a writer appears and a check on the open handle
+  never runs.
+
+- A path in a local profile directory that cannot be resolved for any reason
+  other than non-existence is reported. Treating every resolution failure as
+  "not there" skipped the containment check that follows it.
+
+- `local_dir` or `GKVM_LOCAL_DIR` set while `platform` names an API platform
+  now warns that the directory is ignored, the mirror of the warning the local
+  platform already emitted for `base_url` and `token`. Silently reading the API
+  is the failure mode this backend exists to remove.
+
+- The warning about attributes the local platform ignores names only the
+  attributes that were set. `token` and `github_token` are one value after
+  coalescing, so a configuration setting just the deprecated spelling was told
+  to remove an attribute it never had.
 
 ## [0.2.1] — Retry transient API failures
 

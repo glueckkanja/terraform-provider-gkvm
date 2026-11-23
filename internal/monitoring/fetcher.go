@@ -29,6 +29,10 @@ func FetchProfiles(ctx context.Context, client source.Client, path string) (map[
 		path = "defaults"
 	}
 
+	// One waiting budget for the whole read: a listing plus one request per
+	// profile must not each be allowed to wait out a rate limit.
+	ctx = source.WithRateLimitBudget(ctx, source.ReadWaitBudget)
+
 	entries, err := client.ListDirectory(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("listing profiles directory: %w", err)

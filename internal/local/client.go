@@ -4,8 +4,10 @@ package local
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +15,7 @@ import (
 	"github.com/glueckkanja/terraform-provider-gkvm/internal/source"
 )
 
-// Platform names this backend in error messages.
+// Platform is the value of the provider's platform attribute for this backend.
 const Platform = "local"
 
 var _ source.Client = &Client{}
@@ -112,19 +114,21 @@ func (c *Client) FetchFile(_ context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 
+	// The kind is checked before opening, not after: opening a FIFO blocks
+	// until a writer appears, so a Stat on the handle comes too late.
+	info, err := os.Lstat(target)
+	if err != nil {
+		return nil, fmt.Errorf("reading %q below %s: %w", path, c.Dir, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("reading %q below %s: it is %s, not a regular file", path, c.Dir, kindOf(info.Mode()))
+	}
+
 	file, err := os.Open(target) //nolint:gosec // target is confined to c.Dir by resolve
 	if err != nil {
 		return nil, fmt.Errorf("reading %q below %s: %w", path, c.Dir, err)
 	}
 	defer func() { _ = file.Close() }()
-
-	info, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("reading %q below %s: %w", path, c.Dir, err)
-	}
-	if info.IsDir() {
-		return nil, fmt.Errorf("reading %q below %s: it is a directory, not a file", path, c.Dir)
-	}
 
 	// The cap the API backends apply. One byte past it is read so the limit
 	// can be reported: a truncated profile is often still valid YAML.
@@ -162,16 +166,36 @@ func (c *Client) resolve(path string) (string, error) {
 		return "", err
 	}
 
-	// A path that does not exist is not a containment problem: let the
-	// caller's read report it with its errno.
+	// Non-existence is not a containment problem: let the caller's read report
+	// it with its errno. Any other failure means the guard could not run.
 	resolved, err := filepath.EvalSymlinks(target)
+	if errors.Is(err, fs.ErrNotExist) {
+		return target, nil
+	}
 	if err != nil {
-		return target, nil //nolint:nilerr // non-existence is reported by the caller's read
+		return "", fmt.Errorf("%q below %s cannot be resolved: %w", path, c.Dir, err)
 	}
 	if err := contained(root, resolved); err != nil {
 		return "", fmt.Errorf("%q below %s resolves outside the directory: %w", path, c.Dir, err)
 	}
 	return resolved, nil
+}
+
+// kindOf names a non-regular file for an error message.
+func kindOf(mode fs.FileMode) string {
+	switch {
+	case mode.IsDir():
+		return "a directory"
+	case mode&fs.ModeSymlink != 0:
+		return "a symlink"
+	case mode&fs.ModeNamedPipe != 0:
+		return "a named pipe"
+	case mode&fs.ModeSocket != 0:
+		return "a socket"
+	case mode&fs.ModeDevice != 0:
+		return "a device"
+	}
+	return "not a regular file"
 }
 
 // contained reports whether target is root or sits below it.

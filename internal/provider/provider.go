@@ -23,7 +23,7 @@ import (
 const (
 	PlatformGitHub = "github"
 	PlatformGitLab = "gitlab"
-	PlatformLocal  = "local"
+	PlatformLocal  = local.Platform
 )
 
 // Environment variables the provider reads, in the order it reads them.
@@ -78,11 +78,11 @@ func (p *GkvmProvider) Metadata(_ context.Context, _ provider.MetadataRequest, r
 
 func (p *GkvmProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "GKVM platform provider — reads content from a Git repository for glueckkanja verified modules. Supports GitHub (including GitHub Enterprise Cloud and Enterprise Server) and GitLab (including self-managed instances).",
+		Description: "GKVM platform provider — reads content from a Git repository for glueckkanja verified modules. Supports GitHub (including GitHub Enterprise Cloud and Enterprise Server), GitLab (including self-managed instances), and a directory on disk.",
 		Attributes: map[string]schema.Attribute{
 			"platform": schema.StringAttribute{
 				Optional:    true,
-				Description: "Repository platform to read from: \"github\" (default) or \"gitlab\".",
+				Description: "Repository platform to read from: \"github\" (default), \"gitlab\", or \"local\" to read " + envLocalDir + " / local_dir instead of an API.",
 			},
 			"base_url": schema.StringAttribute{
 				Optional: true,
@@ -159,6 +159,16 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		return
 	}
 
+	// The mirror of the warning the local platform emits: an operator who
+	// exports GKVM_LOCAL_DIR to escape a rate limit must not be left guessing
+	// why one root still reads the API.
+	if platform != PlatformLocal && localDir != "" {
+		resp.Diagnostics.AddWarning(
+			"Local profile directory ignored",
+			fmt.Sprintf("A local profile directory is set but platform is %q, so the profiles are read from the API. Remove the platform attribute to read the directory instead.", platform),
+		)
+	}
+
 	// A left-over github_* attribute on GitLab is not a harmless alias:
 	// github_token would hand a GitHub credential to the GitLab host. The
 	// local backend has no host and no credential, so it only warns.
@@ -229,7 +239,7 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		// platform CLI would otherwise be run once per reader for nothing.
 		warnIgnoredByLocal(resp, map[string]string{
 			"base_url":     baseURL,
-			"token":        configuredToken,
+			"token":        stringValue(config.Token),
 			"github_token": stringValue(config.GithubToken),
 		})
 		client = &local.Client{

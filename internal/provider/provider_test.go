@@ -473,3 +473,49 @@ func diagnostics(resp *provider.ConfigureResponse) string {
 	}
 	return joined.String()
 }
+
+// The mirror of the local platform's warning: an operator who exports
+// GKVM_LOCAL_DIR must learn why one root still reads the API.
+func TestConfigure_WarnsWhenTheLocalDirIsIgnored(t *testing.T) {
+	t.Setenv(envLocalDir, t.TempDir())
+
+	resp := configureCtx(t, bounded(t), map[string]string{
+		"platform":   "github",
+		"repository": "owner/repo",
+		"base_url":   unreachable,
+	})
+
+	warnings := resp.Diagnostics.Warnings()
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %d, want 1: %s", len(warnings), diagnostics(resp))
+	}
+	if !strings.Contains(warnings[0].Summary(), "ignored") {
+		t.Errorf("warning %q does not say the directory is ignored", warnings[0].Summary())
+	}
+}
+
+// The warning must name the attribute that was actually set. token and
+// github_token are one value after coalescing, so reporting both misleads.
+func TestConfigure_LocalWarningNamesOnlyWhatIsSet(t *testing.T) {
+	resp := configure(t, map[string]string{
+		"platform":     "local",
+		"local_dir":    t.TempDir(),
+		"github_repo":  "owner/repo",
+		"github_token": "ghp_example",
+	})
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("expected no error, got %s", diagnostics(resp))
+	}
+	warnings := resp.Diagnostics.Warnings()
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %d, want 1", len(warnings))
+	}
+	detail := warnings[0].Detail()
+	if !strings.Contains(detail, "github_token") {
+		t.Errorf("warning %q does not name github_token", detail)
+	}
+	if strings.Contains(detail, ", token") || strings.HasPrefix(detail, "token") {
+		t.Errorf("warning %q names token, which was never set", detail)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,40 @@ const (
 // rateLimitWaitLimit bounds how long one attempt waits out a rate limit. It is
 // higher than retryAfterLimit: a limit lifts only when its window moves.
 const rateLimitWaitLimit = 90 * time.Second
+
+// ReadWaitBudget is the total a read of many files may spend waiting out rate
+// limits. A limit that needs longer will not lift inside the read either.
+const ReadWaitBudget = rateLimitWaitLimit
+
+// budget is the wall clock one read may spend waiting out rate limits. It is
+// shared, so a read of many files cannot spend the bound once per request.
+type budget struct {
+	mu        sync.Mutex
+	remaining time.Duration
+}
+
+type budgetKey struct{}
+
+// WithRateLimitBudget gives every request made under ctx one shared waiting
+// budget. A read of many files needs this; a single request gets its own.
+func WithRateLimitBudget(ctx context.Context, total time.Duration) context.Context {
+	return context.WithValue(ctx, budgetKey{}, &budget{remaining: total})
+}
+
+// takeWait reserves a wait from the budget in ctx and reports whether it fit.
+func takeWait(ctx context.Context, d time.Duration) bool {
+	b, ok := ctx.Value(budgetKey{}).(*budget)
+	if !ok {
+		return d <= rateLimitWaitLimit
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if d > b.remaining {
+		return false
+	}
+	b.remaining -= d
+	return true
+}
 
 // Delays are variables so tests can shrink them; production never changes them.
 var (
@@ -259,6 +294,11 @@ func (r *Requester) onEndpoint(rawURL string) bool {
 // Get fetches a URL on the configured endpoint and returns the response body,
 // retrying transient failures with a bounded backoff.
 func (r *Requester) Get(ctx context.Context, requestURL, accept string) ([]byte, error) {
+	// A request outside a read still needs a bound, or a sustained limit would
+	// let one call sleep the per-attempt cap four times over.
+	if _, ok := ctx.Value(budgetKey{}).(*budget); !ok {
+		ctx = WithRateLimitBudget(ctx, rateLimitWaitLimit)
+	}
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		body, delay, retryable, err := r.get(ctx, requestURL, accept, attempt)
@@ -315,8 +355,6 @@ type throttle struct {
 	limited bool
 	// wait: how long the response asks the caller to hold off.
 	wait time.Duration
-	// beyond: the wait outlasts the read, so it reports instead of retrying.
-	beyond bool
 }
 
 // rateLimitHeaders are the remaining-request counters of both platforms.
@@ -339,9 +377,6 @@ func classifyThrottle(status int, header http.Header, attempt int) throttle {
 	if !explicit {
 		// No hint on how long: back off rather than guess at the window.
 		return throttle{limited: true, wait: backoff(attempt)}
-	}
-	if wait > rateLimitWaitLimit {
-		return throttle{limited: true, wait: wait, beyond: true}
 	}
 	return throttle{limited: true, wait: wait}
 }
@@ -453,8 +488,10 @@ func (r *Requester) get(ctx context.Context, requestURL, accept string, attempt 
 		// Throttling first: it is the one condition a status code alone
 		// cannot name, because 403 serves double duty.
 		switch t := classifyThrottle(resp.StatusCode, resp.Header, attempt); {
-		case t.beyond:
-			hint = fmt.Sprintf(" (rate limited and the limit does not lift for %s, longer than a read waits — spread the reads out, cache them, or use a token with a higher limit)",
+		case t.limited && attempt == maxAttempts:
+			hint = fmt.Sprintf(" (rate limited; gave up after %d attempts)", maxAttempts)
+		case t.limited && !takeWait(ctx, t.wait):
+			hint = fmt.Sprintf(" (rate limited and the limit does not lift for %s, more than this read may wait — spread the reads out, bundle them, or use a token with a higher limit)",
 				t.wait.Round(time.Second))
 		case t.limited:
 			hint = fmt.Sprintf(" (rate limited; waiting %s before attempt %d of %d)",
