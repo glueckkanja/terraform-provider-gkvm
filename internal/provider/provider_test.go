@@ -2,8 +2,13 @@ package provider
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/glueckkanja/terraform-provider-gkvm/internal/local"
 
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
@@ -11,6 +16,15 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 )
+
+// TestMain clears the environment this package reads: an exported
+// GKVM_LOCAL_DIR would otherwise reroute every case that names no platform.
+func TestMain(m *testing.M) {
+	for _, name := range []string{envLocalDir, envBaseURL, envToken, envGHToken, envGitHubToken, envGitLabToken, envCIJobToken} {
+		_ = os.Unsetenv(name)
+	}
+	os.Exit(m.Run())
+}
 
 func TestGkvmProvider_Metadata(t *testing.T) {
 	p := &GkvmProvider{version: "1.2.3"}
@@ -36,7 +50,7 @@ func providerSchema(t *testing.T) schema.Schema {
 func TestGkvmProvider_Schema(t *testing.T) {
 	attrs := providerSchema(t).Attributes
 
-	for _, name := range []string{"platform", "base_url", "repository", "ref", "token"} {
+	for _, name := range []string{"platform", "base_url", "repository", "ref", "token", "local_dir"} {
 		if _, ok := attrs[name]; !ok {
 			t.Errorf("schema missing %s attribute", name)
 		}
@@ -86,6 +100,13 @@ func TestNew_ReturnsProvider(t *testing.T) {
 // made, so none of them touches the network.
 func configure(t *testing.T, attrs map[string]string) *provider.ConfigureResponse {
 	t.Helper()
+	return configureCtx(t, context.Background(), attrs)
+}
+
+// configureCtx is configure with a caller-supplied context, so a test that
+// expects the provider to reach the network can bound how long it tries.
+func configureCtx(t *testing.T, ctx context.Context, attrs map[string]string) *provider.ConfigureResponse {
+	t.Helper()
 	t.Setenv(envToken, "dummy-token")
 	t.Setenv(envBaseURL, "")
 
@@ -105,7 +126,7 @@ func configure(t *testing.T, attrs map[string]string) *provider.ConfigureRespons
 	}
 
 	resp := &provider.ConfigureResponse{}
-	(&GkvmProvider{}).Configure(context.Background(),
+	(&GkvmProvider{}).Configure(ctx,
 		provider.ConfigureRequest{Config: tfsdk.Config{Schema: s, Raw: tftypes.NewValue(objType, values)}},
 		resp)
 	return resp
@@ -284,4 +305,171 @@ func TestTokenHelp_NamesTheHostAndTheCommand(t *testing.T) {
 	if !strings.Contains(gl, "gitlab.example.com") || !strings.Contains(gl, "glab auth login") {
 		t.Errorf("GitLab help is not actionable: %s", gl)
 	}
+}
+
+// unreachable has nothing behind it, which makes it a reliable probe for
+// whether a request was attempted at all.
+const unreachable = "https://127.0.0.1:1"
+
+// bounded keeps a test expecting a failed connection off the retry schedule.
+func bounded(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+// The point of the local backend: a configuration naming an endpoint performs
+// no request. A clean Configure against an unreachable endpoint proves it.
+func TestConfigure_LocalDirMakesNoRequest(t *testing.T) {
+	dir := t.TempDir()
+
+	resp := configureCtx(t, bounded(t), map[string]string{
+		"repository": "owner/repo",
+		"base_url":   unreachable,
+		"local_dir":  dir,
+	})
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("expected no error, got %s", diagnostics(resp))
+	}
+	data, ok := resp.DataSourceData.(*providerData)
+	if !ok {
+		t.Fatal("provider did not publish its client")
+	}
+	if _, ok := data.Client.(*local.Client); !ok {
+		t.Fatalf("client is %T, want the local backend", data.Client)
+	}
+}
+
+// The oracle for the test above: without the local directory the same
+// configuration must fail, or that test passes for the wrong reason.
+func TestConfigure_WithoutLocalDirTheEndpointIsContacted(t *testing.T) {
+	resp := configureCtx(t, bounded(t), map[string]string{
+		"repository": "owner/repo",
+		"base_url":   unreachable,
+	})
+
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected the unreachable endpoint to be reported")
+	}
+	if !strings.Contains(diagnostics(resp), "Failed to connect to the repository") {
+		t.Errorf("diagnostics %q do not report a failed connection", diagnostics(resp))
+	}
+}
+
+func TestConfigure_LocalDirFromTheEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	// Why the environment can select it: the heaviest readers are generated
+	// configurations nobody can edit.
+	t.Setenv(envLocalDir, dir)
+
+	resp := configureCtx(t, bounded(t), map[string]string{
+		"repository": "owner/repo",
+		"base_url":   unreachable,
+	})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("expected the environment to select the local backend, got %s", diagnostics(resp))
+	}
+}
+
+func TestConfigure_ExplicitPlatformBeatsTheEnvironment(t *testing.T) {
+	t.Setenv(envLocalDir, t.TempDir())
+
+	// A configuration insisting on the API keeps reading the API.
+	resp := configureCtx(t, bounded(t), map[string]string{
+		"platform":   "github",
+		"repository": "owner/repo",
+		"base_url":   unreachable,
+	})
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("an explicit platform was overridden by the environment")
+	}
+}
+
+func TestConfigure_LocalWithoutARepository(t *testing.T) {
+	// A directory needs no repository: nothing is addressed by name.
+	resp := configure(t, map[string]string{
+		"platform":  "local",
+		"local_dir": t.TempDir(),
+	})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("expected no error, got %s", diagnostics(resp))
+	}
+}
+
+func TestConfigure_LocalRejects(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "not-created")
+
+	tests := []struct {
+		name       string
+		attrs      map[string]string
+		wantSubstr string
+	}{
+		{
+			name:       "no directory at all",
+			attrs:      map[string]string{"platform": "local", "repository": "owner/repo"},
+			wantSubstr: "must not be empty",
+		},
+		{
+			name:       "relative directory",
+			attrs:      map[string]string{"platform": "local", "local_dir": "bundle/profiles"},
+			wantSubstr: "absolute path",
+		},
+		// Must fail loudly: an empty profile set is invisible in a plan.
+		{
+			name:       "directory does not exist",
+			attrs:      map[string]string{"platform": "local", "local_dir": missing},
+			wantSubstr: "cannot be read",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := configure(t, tt.attrs)
+			if !resp.Diagnostics.HasError() {
+				t.Fatal("expected an error diagnostic, got none")
+			}
+			if !strings.Contains(diagnostics(resp), tt.wantSubstr) {
+				t.Errorf("diagnostics %q do not mention %q", diagnostics(resp), tt.wantSubstr)
+			}
+		})
+	}
+}
+
+func TestConfigure_LocalWarnsAboutIgnoredAttributes(t *testing.T) {
+	resp := configure(t, map[string]string{
+		"platform":   "local",
+		"local_dir":  t.TempDir(),
+		"repository": "owner/repo",
+		"base_url":   "https://ghe.example.com",
+		"token":      "ghp_example",
+	})
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("ignored attributes must not be fatal, got %s", diagnostics(resp))
+	}
+	warnings := resp.Diagnostics.Warnings()
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %d, want 1", len(warnings))
+	}
+	detail := warnings[0].Detail()
+	for _, name := range []string{"base_url", "token"} {
+		if !strings.Contains(detail, name) {
+			t.Errorf("warning %q does not name %s", detail, name)
+		}
+	}
+	// The credential must never appear in a diagnostic.
+	if strings.Contains(detail, "ghp_example") {
+		t.Error("the warning repeats the token value")
+	}
+}
+
+// diagnostics flattens every diagnostic into one string for assertions.
+func diagnostics(resp *provider.ConfigureResponse) string {
+	var joined strings.Builder
+	for _, d := range resp.Diagnostics {
+		joined.WriteString(d.Summary() + " " + d.Detail() + "\n")
+	}
+	return joined.String()
 }

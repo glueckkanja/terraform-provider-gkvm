@@ -38,6 +38,12 @@ provider "gkvm" {
   repository = "my-org/gkvm-monitoring-defaults"
 }
 
+# A directory on disk instead of the API — no requests, no token
+provider "gkvm" {
+  platform  = "local"
+  local_dir = "/srv/bundle/gkvm-monitoring-defaults"
+}
+
 # GitLab self-managed (the /api/v4 suffix is added for you)
 provider "gkvm" {
   platform   = "gitlab"

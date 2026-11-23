@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+### Added
+
+- `platform = "local"` and `local_dir` — read the profiles from a directory on
+  disk instead of from a repository API. Reads become local file I/O: no
+  requests, no rate limit, and no token (none is resolved, and the platform
+  CLI is not run either).
+
+  One provider instance reads the profiles with one directory listing plus one
+  request per profile file, which is fine for a single configuration and
+  expensive for a tool that runs many: every OpenTofu process holds its own
+  provider instance, so a run over N units repeats that work N times against
+  the same unchanging content. With a few dozen profiles and a few dozen units
+  it is the rate limit, not the content, that decides whether the run finishes.
+
+  `local_dir` also comes from the `GKVM_LOCAL_DIR` environment variable, and
+  setting either one selects the local platform unless `platform` says
+  otherwise. That is what makes the backend reachable for a generated
+  configuration nobody can edit: a CI job that already clones the repository
+  exports the variable, and every reader in the run follows it. An explicit
+  `platform` always wins, so a configuration can insist on reading the API.
+
+  The directory stands in for the repository root, so `profile_path` keeps its
+  meaning. `repository` and `ref` may still be set and are reported in error
+  messages, but nothing verifies them against the directory — a directory
+  carries no provenance, so pin the ref in whatever fetches it. `base_url`,
+  `token` and `github_token` are ignored and reported as a warning rather than
+  an error, because the configuration this backend is reached from was written
+  for the API.
+
+  Failures are loud: a directory that is missing, is not a directory, or cannot
+  be listed is reported when the provider is configured, and one that holds no
+  YAML profile is reported when it is read. A silently empty profile set would
+  become a plan that drops every default alert, and a missing alert is not
+  something a plan shows.
+
 ### Fixed
 
 - A rate-limited HTTP 403 is retried and named as a rate limit. GitHub answers

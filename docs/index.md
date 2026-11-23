@@ -13,6 +13,10 @@ It talks to the REST API of the repository platform. Both supported platforms
 work in every deployment shape — public SaaS, enterprise tenant, or a server
 your own organization runs — because the endpoint is configurable.
 
+It can also read a directory on disk instead of an API, which is the right
+choice wherever one run reads the profiles many times over. See
+[Local directory](#local-directory).
+
 ## Example Usage
 
 ### GitHub.com
@@ -74,6 +78,21 @@ provider "gkvm" {
 }
 ```
 
+### Local directory
+
+```hcl
+provider "gkvm" {
+  platform  = "local"
+  local_dir = "/srv/bundle/gkvm-monitoring-defaults"
+}
+```
+
+`local_dir` also comes from the `GKVM_LOCAL_DIR` environment variable, and
+setting either one selects `platform = "local"` unless `platform` says
+otherwise. That makes the backend reachable for a generated configuration
+nobody can edit: a CI job exports the variable and every reader in the run
+follows it.
+
 ## Endpoints
 
 `base_url` takes the REST API endpoint. When it is omitted, the platform
@@ -94,13 +113,15 @@ instead would produce a 404 that reads like a wrong repository.
 | GitHub Enterprise Server | `github` | `https://HOSTNAME` | `https://HOSTNAME/api/v3` |
 | GitLab.com | `gitlab` | *(omit)* | `https://gitlab.com/api/v4` |
 | GitLab self-managed / dedicated | `gitlab` | `https://HOSTNAME` | `https://HOSTNAME/api/v4` |
+| Directory on disk | `local` | *(ignored)* | none — `local_dir` is read |
 
 `base_url` must use `https`. A proxy is configured through the standard
 `HTTPS_PROXY` / `NO_PROXY` environment variables, not by changing the scheme.
 
 ## Authentication
 
-The token is resolved from the first source that yields a value:
+`platform = "local"` needs no credential and resolves none. For the API
+platforms the token is resolved from the first source that yields a value:
 
 | Order | GitHub | GitLab |
 |---|---|---|
@@ -142,6 +163,34 @@ Required permissions:
 
 Tokens are never written to state and never appear in error messages.
 
+## Reading a directory instead of an API
+
+One provider instance reads the profiles with one directory listing plus one
+request per profile file. That is fine for a single configuration and
+expensive for a tool that runs many: every OpenTofu process holds its own
+provider instance, so a run over N units performs N times that work against
+the same unchanging content. With a few dozen profiles and a few dozen units
+it is the rate limit, not the content, that decides whether the run succeeds.
+
+`platform = "local"` replaces the whole read with local file I/O:
+
+- no requests, so no primary or secondary rate limit
+- no token — none is resolved, and the platform CLI is not run either
+- the same bytes for every reader in the run
+
+The directory stands in for the repository root, so `profile_path` on the data
+source keeps its meaning. Content normally comes from a build step that
+already clones the repository for other reasons.
+
+What it does not do is prove where the content came from. `repository` and
+`ref` may still be set and are reported in error messages, but nothing checks
+them against the directory — pin the ref in whatever fetches it.
+
+Failures are loud by design: a directory that is missing, is not a directory,
+or cannot be listed is reported when the provider is configured, and one that
+holds no YAML profile is reported when it is read. An empty profile set would
+otherwise become a plan that silently drops every default alert.
+
 ## Network requirements
 
 Every request goes to the one host in `base_url` — the directory listing and
@@ -160,6 +209,7 @@ Allow outbound HTTPS from the machine running Terraform to:
 | GitHub.com | `api.github.com` |
 | GitHub Enterprise | the host in `base_url` |
 | GitLab | the host in `base_url` (`gitlab.com` by default) |
+| `local` | none — nothing leaves the machine |
 
 ## Migrating from v0.1.x
 
@@ -182,7 +232,8 @@ before.
 
 ### Optional
 
-- `platform` (String) Repository platform: `github` (default) or `gitlab`.
+- `platform` (String) Repository platform: `github` (default), `gitlab`, or
+  `local` to read a directory instead of an API.
 - `base_url` (String) REST API endpoint of the deployment. Defaults to
   `https://api.github.com` or `https://gitlab.com/api/v4` depending on
   `platform`, and falls back to the `GKVM_BASE_URL` environment variable. Must
@@ -195,6 +246,11 @@ before.
   `main`.
 - `token` (String, Sensitive) Access token with read access to the repository
   contents. Resolved from the environment or the platform CLI when unset.
+  Ignored by `platform = "local"`, which resolves no token at all.
+- `local_dir` (String) Absolute path of a directory holding the repository
+  content, read instead of the API. Falls back to the `GKVM_LOCAL_DIR`
+  environment variable, and setting either one selects `platform = "local"`
+  unless `platform` says otherwise.
 - `github_repo` (String, **Deprecated**) Use `repository`.
 - `github_ref` (String, **Deprecated**) Use `ref`.
 - `github_token` (String, Sensitive, **Deprecated**) Use `token`.
