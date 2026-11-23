@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -526,5 +527,217 @@ func TestGet_RetryStopsOnCancelledContext(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("calls = %d, want 1 (the backoff must not outlive the context)", got)
+	}
+}
+
+// header builds the response headers classifyThrottle reads.
+func header(pairs map[string]string) http.Header {
+	h := http.Header{}
+	for name, value := range pairs {
+		h.Set(name, value)
+	}
+	return h
+}
+
+func TestClassifyThrottle(t *testing.T) {
+	// Far enough out that the reset path cannot be mistaken for the bound.
+	soon := time.Now().Add(30 * time.Second).Unix()
+	late := time.Now().Add(45 * time.Minute).Unix()
+
+	tests := []struct {
+		name        string
+		status      int
+		header      http.Header
+		wantLimited bool
+		wantBeyond  bool
+		wantWait    time.Duration // checked only when exact
+		exactWait   bool
+	}{
+		{
+			name:        "429 without any hint is throttling",
+			status:      http.StatusTooManyRequests,
+			header:      header(nil),
+			wantLimited: true,
+		},
+		{
+			name:        "429 with Retry-After uses it",
+			status:      http.StatusTooManyRequests,
+			header:      header(map[string]string{"Retry-After": "7"}),
+			wantLimited: true,
+			wantWait:    7 * time.Second,
+			exactWait:   true,
+		},
+		// The case this exists for: only one kind of 403 is worth retrying.
+		{
+			name:        "403 with Retry-After is a rate limit",
+			status:      http.StatusForbidden,
+			header:      header(map[string]string{"Retry-After": "12"}),
+			wantLimited: true,
+			wantWait:    12 * time.Second,
+			exactWait:   true,
+		},
+		{
+			name:        "403 with an exhausted GitHub counter is a rate limit",
+			status:      http.StatusForbidden,
+			header:      header(map[string]string{"X-RateLimit-Remaining": "0"}),
+			wantLimited: true,
+		},
+		{
+			name:        "403 with an exhausted GitLab counter is a rate limit",
+			status:      http.StatusForbidden,
+			header:      header(map[string]string{"RateLimit-Remaining": "0"}),
+			wantLimited: true,
+		},
+		{
+			name:        "403 with requests left is a permission problem",
+			status:      http.StatusForbidden,
+			header:      header(map[string]string{"X-RateLimit-Remaining": "4231"}),
+			wantLimited: false,
+		},
+		{
+			name:        "bare 403 is a permission problem",
+			status:      http.StatusForbidden,
+			header:      header(nil),
+			wantLimited: false,
+		},
+		{
+			name:        "404 is never throttling",
+			status:      http.StatusNotFound,
+			header:      header(map[string]string{"Retry-After": "5"}),
+			wantLimited: false,
+		},
+		{
+			name:        "503 is handled as a server error, not a limit",
+			status:      http.StatusServiceUnavailable,
+			header:      header(map[string]string{"Retry-After": "5"}),
+			wantLimited: false,
+		},
+		{
+			name:        "a reset within the bound is waited out",
+			status:      http.StatusForbidden,
+			header:      header(map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": strconv.FormatInt(soon, 10)}),
+			wantLimited: true,
+		},
+		// Five attempts cannot outlast a 45-minute window.
+		{
+			name:        "a reset beyond the bound is reported, not retried",
+			status:      http.StatusTooManyRequests,
+			header:      header(map[string]string{"X-RateLimit-Reset": strconv.FormatInt(late, 10)}),
+			wantLimited: true,
+			wantBeyond:  true,
+		},
+		{
+			name:        "a Retry-After beyond the bound is reported, not retried",
+			status:      http.StatusForbidden,
+			header:      header(map[string]string{"Retry-After": "600"}),
+			wantLimited: true,
+			wantBeyond:  true,
+			wantWait:    600 * time.Second,
+			exactWait:   true,
+		},
+		{
+			name:        "a reset already in the past may be retried at once",
+			status:      http.StatusTooManyRequests,
+			header:      header(map[string]string{"X-RateLimit-Reset": strconv.FormatInt(time.Now().Add(-time.Minute).Unix(), 10)}),
+			wantLimited: true,
+			wantWait:    0,
+			exactWait:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyThrottle(tt.status, tt.header, 1)
+			if got.limited != tt.wantLimited {
+				t.Errorf("limited = %v, want %v", got.limited, tt.wantLimited)
+			}
+			if got.beyond != tt.wantBeyond {
+				t.Errorf("beyond = %v, want %v", got.beyond, tt.wantBeyond)
+			}
+			if tt.exactWait && got.wait != tt.wantWait {
+				t.Errorf("wait = %v, want %v", got.wait, tt.wantWait)
+			}
+			if tt.wantLimited && !tt.exactWait && got.wait <= 0 {
+				t.Errorf("wait = %v, want a positive delay", got.wait)
+			}
+		})
+	}
+}
+
+func TestGet_RetriesSecondaryRateLimitThenSucceeds(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			// A secondary rate limit: a 403 asking for a wait, not a denial.
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, "You have exceeded a secondary rate limit", http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	if _, err := r.Get(context.Background(), r.Base()+"/anything", "application/json"); err != nil {
+		t.Fatalf("expected success after the limit lifted, got %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("calls = %d, want 2", got)
+	}
+}
+
+func TestGet_DoesNotRetryALimitThatOutlastsTheRead(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "1800")
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+	}))
+
+	_, err := r.Get(context.Background(), r.Base()+"/anything", "application/json")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	// One attempt, not five: the answer will not change inside the read.
+	if got := calls.Load(); got != 1 {
+		t.Errorf("calls = %d, want 1", got)
+	}
+	if !strings.Contains(err.Error(), "30m0s") {
+		t.Errorf("error %q does not say how long the limit lasts", err)
+	}
+}
+
+// A rate-limited 403 used to be reported as a permission problem. This pins
+// the wording of both kinds so they cannot be confused again.
+func TestGet_RateLimited403DoesNotBlameTheToken(t *testing.T) {
+	fastRetries(t)
+
+	limited := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "1800")
+		http.Error(w, "secondary rate limit", http.StatusForbidden)
+	}))
+	_, err := limited.Get(context.Background(), limited.Base()+"/anything", "application/json")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "rate limited") {
+		t.Errorf("rate-limited 403 error %q does not name the rate limit", err)
+	}
+	if strings.Contains(err.Error(), "token permissions") {
+		t.Errorf("rate-limited 403 error %q blames the token", err)
+	}
+
+	denied := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "Resource not accessible by integration", http.StatusForbidden)
+	}))
+	_, err = denied.Get(context.Background(), denied.Base()+"/anything", "application/json")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "token permissions") {
+		t.Errorf("permission 403 error %q no longer points at the token", err)
+	}
+	if strings.Contains(err.Error(), "rate limited") {
+		t.Errorf("permission 403 error %q claims a rate limit", err)
 	}
 }

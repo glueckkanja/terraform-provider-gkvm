@@ -25,11 +25,15 @@ const maxRedirects = 5
 
 // Retry bounds for transient failures. A single 5xx from the API used to fail a
 // whole plan: every unit reads the profiles, so one blip anywhere turned the run
-// red. Permanent answers (4xx other than 429) are never retried.
+// red. Permanent answers are never retried.
 const (
 	maxAttempts     = 5
 	retryAfterLimit = 10 * time.Second
 )
+
+// rateLimitWaitLimit bounds how long one attempt waits out a rate limit. It is
+// higher than retryAfterLimit: a limit lifts only when its window moves.
+const rateLimitWaitLimit = 90 * time.Second
 
 // Delays are variables so tests can shrink them; production never changes them.
 var (
@@ -305,6 +309,76 @@ func retryAfter(header string, attempt int) time.Duration {
 	return backoff(attempt)
 }
 
+// throttle describes a throttling answer from the API.
+type throttle struct {
+	// limited: a rate-limit answer rather than a permission or server error.
+	limited bool
+	// wait: how long the response asks the caller to hold off.
+	wait time.Duration
+	// beyond: the wait outlasts the read, so it reports instead of retrying.
+	beyond bool
+}
+
+// rateLimitHeaders are the remaining-request counters of both platforms.
+// Header.Get is case-insensitive, the X- prefix is not.
+var rateLimitHeaders = []string{"X-RateLimit-Remaining", "RateLimit-Remaining"}
+
+// classifyThrottle decides whether a non-OK response is throttling. 429 is
+// unambiguous; a 403 is GitHub's answer to both a secondary rate limit and a
+// token that may not read, told apart by Retry-After or an exhausted counter.
+func classifyThrottle(status int, header http.Header, attempt int) throttle {
+	limited := status == http.StatusTooManyRequests
+	if status == http.StatusForbidden {
+		limited = header.Get("Retry-After") != "" || exhausted(header)
+	}
+	if !limited {
+		return throttle{}
+	}
+
+	wait, explicit := requestedWait(header)
+	if !explicit {
+		// No hint on how long: back off rather than guess at the window.
+		return throttle{limited: true, wait: backoff(attempt)}
+	}
+	if wait > rateLimitWaitLimit {
+		return throttle{limited: true, wait: wait, beyond: true}
+	}
+	return throttle{limited: true, wait: wait}
+}
+
+// exhausted reports whether a remaining-request counter is present and at
+// zero. A counter the platform did not send is not evidence of anything.
+func exhausted(header http.Header) bool {
+	for _, name := range rateLimitHeaders {
+		if value := header.Get(name); value != "" {
+			if remaining, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && remaining <= 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// requestedWait reads the wait the response asks for, from Retry-After
+// (relative) or a rate-limit reset (epoch), and whether it said anything.
+func requestedWait(header http.Header) (time.Duration, bool) {
+	if seconds, err := strconv.Atoi(strings.TrimSpace(header.Get("Retry-After"))); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second, true
+	}
+	for _, name := range []string{"X-RateLimit-Reset", "RateLimit-Reset"} {
+		if value := header.Get(name); value != "" {
+			if epoch, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
+				// A reset in the past means the window already moved.
+				if d := time.Until(time.Unix(epoch, 0)); d > 0 {
+					return d, true
+				}
+				return 0, true
+			}
+		}
+	}
+	return 0, false
+}
+
 // get performs one request. It reports whether the failure is worth retrying
 // and, if so, how long to wait first.
 func (r *Requester) get(ctx context.Context, requestURL, accept string, attempt int) ([]byte, time.Duration, bool, error) {
@@ -370,21 +444,33 @@ func (r *Requester) get(ctx context.Context, requestURL, accept string, attempt 
 	if resp.StatusCode != http.StatusOK {
 		// Sanitize: include status code and subject but NOT the response body,
 		// which may carry tokens or internal details from proxies.
-		hint := ""
-		switch resp.StatusCode {
-		case http.StatusUnauthorized:
+		var (
+			hint      string
+			retryable bool
+			delay     time.Duration
+		)
+
+		// Throttling first: it is the one condition a status code alone
+		// cannot name, because 403 serves double duty.
+		switch t := classifyThrottle(resp.StatusCode, resp.Header, attempt); {
+		case t.beyond:
+			hint = fmt.Sprintf(" (rate limited and the limit does not lift for %s, longer than a read waits — spread the reads out, cache them, or use a token with a higher limit)",
+				t.wait.Round(time.Second))
+		case t.limited:
+			hint = fmt.Sprintf(" (rate limited; waiting %s before attempt %d of %d)",
+				t.wait.Round(time.Millisecond), attempt+1, maxAttempts)
+			retryable, delay = true, t.wait
+		case resp.StatusCode >= 500:
+			retryable = true
+			delay = retryAfter(resp.Header.Get("Retry-After"), attempt)
+		case resp.StatusCode == http.StatusUnauthorized:
 			hint = " (check that the token is valid, unexpired, and issued by this endpoint)"
-		case http.StatusForbidden:
+		case resp.StatusCode == http.StatusForbidden:
 			hint = " (check token permissions — read access to the repository contents is required)"
-		case http.StatusNotFound:
+		case resp.StatusCode == http.StatusNotFound:
 			hint = " (check that the endpoint, repository, ref, and path exist — a token without read access also reports 404)"
 		}
-		// 5xx is the server failing, 429 is throttling: both are worth another go.
-		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
-		delay := time.Duration(0)
-		if retryable {
-			delay = retryAfter(resp.Header.Get("Retry-After"), attempt)
-		}
+
 		return nil, delay, retryable, fmt.Errorf("%s API at %s returned HTTP %d for %s%s",
 			r.Platform, r.Base(), resp.StatusCode, r.Subject, hint)
 	}

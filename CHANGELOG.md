@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- A rate-limited HTTP 403 is retried and named as a rate limit. GitHub answers
+  both "this token may not read that" and "you are over a secondary rate
+  limit" with 403, and only the first was ever treated as permanent — so a
+  secondary limit failed the read on the first attempt and blamed the token
+  while doing it (`check token permissions`). A 403 that carries a
+  `Retry-After` header or an exhausted remaining-request counter is now
+  retried like a 429, and its message names the limit instead of the token. A
+  403 without that evidence stays permanent and keeps its wording, so a
+  genuinely insufficient token still fails on the first attempt.
+
+- A rate limit that outlasts the read is reported instead of retried. A limit
+  asking for half an hour cannot be waited out in five attempts, so the read
+  now says how long it lasts rather than spending its attempts to fail
+  anyway. Waits up to 90 seconds are honoured — more than the 10 second cap
+  applied to a 5xx, because a limit lifts only when its window moves while a
+  server error may be gone on the next try.
+
 ## [0.2.1] — Retry transient API failures
 
 ### Fixed
