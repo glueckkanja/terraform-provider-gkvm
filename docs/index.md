@@ -184,7 +184,14 @@ already clones the repository for other reasons.
 
 What it does not do is prove where the content came from. `repository` and
 `ref` may still be set and are reported in error messages, but nothing checks
-them against the directory — pin the ref in whatever fetches it.
+them against the directory — pin the ref in whatever fetches it. When
+`GKVM_LOCAL_DIR` rather than the configuration selected the directory and a
+`repository` is configured, the provider warns that the repository is not the
+thing being read.
+
+The directory must contain the files themselves. A symlink that stays inside it
+is followed, but one pointing outside is refused — so a builder serving several
+readers from one clone has to copy the files in rather than link to them.
 
 Failures are loud by design: a directory that is missing, is not a directory,
 or cannot be listed is reported when the provider is configured, and one that

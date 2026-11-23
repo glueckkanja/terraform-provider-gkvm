@@ -40,6 +40,12 @@ const rateLimitWaitLimit = 90 * time.Second
 // limits. A limit that needs longer will not lift inside the read either.
 const ReadWaitBudget = rateLimitWaitLimit
 
+// ProbeWaitBudget is what a reachability check may spend. It is small on
+// purpose: the check runs once per process, so a long wait multiplies by the
+// number of units, but a concurrency burst clears in a second or two and
+// failing on that would be the re-run-required failure retrying removed.
+const ProbeWaitBudget = 5 * time.Second
+
 // budget is the wall clock one read may spend waiting out rate limits. It is
 // shared, so a read of many files cannot spend the bound once per request.
 type budget struct {
@@ -415,11 +421,12 @@ func requestedWait(header http.Header) (time.Duration, bool) {
 	for _, name := range []string{"X-RateLimit-Reset", "RateLimit-Reset"} {
 		if value := header.Get(name); value != "" {
 			if epoch, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
-				// A reset in the past means the window already moved.
+				// A reset in the past is a skewed clock or a stale proxy
+				// header, not permission to hammer an active limiter.
 				if d := time.Until(time.Unix(epoch, 0)); d > 0 {
 					return d, true
 				}
-				return 0, true
+				return 0, false
 			}
 		}
 	}
@@ -508,17 +515,19 @@ func (r *Requester) get(ctx context.Context, requestURL, accept string, attempt 
 		case t.limited && attempt == maxAttempts:
 			hint = fmt.Sprintf(" (rate limited for %s; gave up after %d attempts)",
 				t.wait.Round(time.Second), maxAttempts)
+		// Checked before the refusals: a limit asking for no wait at all is a
+		// free retry, and refusing it for want of budget spends nothing to fail.
+		case t.limited && wait.fits:
+			hint = fmt.Sprintf(" (rate limited; waiting %s before attempt %d of %d)",
+				t.wait.Round(time.Millisecond), attempt+1, maxAttempts)
+			retryable, delay = true, t.wait
 		case t.limited && wait.total <= 0:
 			hint = fmt.Sprintf(" (rate limited for %s; this check does not wait a limit out)", t.wait.Round(time.Second))
 		case t.limited && wait.available <= 0:
 			hint = " (rate limited, and this read has already spent its waiting budget on earlier requests — bundle the content or use a token with a higher limit)"
-		case t.limited && !wait.fits:
+		case t.limited:
 			hint = fmt.Sprintf(" (rate limited and the limit does not lift for %s, more than the %s this read may still wait — spread the reads out, bundle them, or use a token with a higher limit)",
 				t.wait.Round(time.Second), wait.available.Round(time.Second))
-		case t.limited:
-			hint = fmt.Sprintf(" (rate limited; waiting %s before attempt %d of %d)",
-				t.wait.Round(time.Millisecond), attempt+1, maxAttempts)
-			retryable, delay = true, t.wait
 		case resp.StatusCode >= 500:
 			retryable = true
 			delay = retryAfter(resp.Header.Get("Retry-After"), attempt)

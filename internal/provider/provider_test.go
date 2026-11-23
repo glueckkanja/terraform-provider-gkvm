@@ -555,3 +555,43 @@ func TestConfigure_LocalWarningIgnoresEnvironmentEndpoint(t *testing.T) {
 		}
 	}
 }
+
+// Nothing proves a directory holds the repository a root names, so when the
+// environment made that choice the reader has to be told what is not read.
+func TestConfigure_WarnsWhenTheEnvironmentReplacesTheRepository(t *testing.T) {
+	t.Setenv(envLocalDir, t.TempDir())
+
+	resp := configureCtx(t, bounded(t), map[string]string{
+		"repository": "owner/repo",
+		"ref":        "v2",
+	})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("expected no error, got %s", diagnostics(resp))
+	}
+
+	var found bool
+	for _, w := range resp.Diagnostics.Warnings() {
+		if strings.Contains(w.Detail(), "owner/repo") && strings.Contains(w.Detail(), "v2") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no warning names the repository that is not read: %s", diagnostics(resp))
+	}
+}
+
+// A configuration that asked for the directory itself needs no such warning:
+// it knows what it is reading.
+func TestConfigure_SilentWhenTheConfigurationChoseTheDirectory(t *testing.T) {
+	resp := configure(t, map[string]string{
+		"platform":   "local",
+		"local_dir":  t.TempDir(),
+		"repository": "owner/repo",
+	})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("expected no error, got %s", diagnostics(resp))
+	}
+	if n := len(resp.Diagnostics.Warnings()); n != 0 {
+		t.Errorf("warnings = %d, want 0: %s", n, diagnostics(resp))
+	}
+}

@@ -79,10 +79,28 @@
   `echo "X=$dir" >> $GITHUB_ENV` produces — selected the local platform and
   then failed on a character invisible in the diagnostic.
 
-- The reachability check made when the provider is configured no longer waits
-  out a rate limit. It runs once per provider instance, so one per unit each
-  sleeping through a limit turned a fast failure into a long one, and the check
-  only answers whether the endpoint is reachable.
+- The reachability check made when the provider is configured gets a five
+  second waiting budget rather than the read's ninety. It runs once per
+  provider instance, so a long wait multiplies by the number of readers, while
+  the concurrency burst those same readers cause clears in a moment — failing
+  on that would be the re-run-required failure retrying was added to remove.
+
+- A throttling answer that asks for no wait at all is retried immediately
+  instead of being refused for want of budget: refusing it spends nothing and
+  fails anyway.
+
+- A rate-limit reset timestamp already in the past is backed off rather than
+  retried at once. A skewed clock or a stale proxy header would otherwise fire
+  every attempt within milliseconds at an active limiter.
+
+- `GKVM_LOCAL_DIR` selecting the directory while a `repository` is configured
+  warns that the repository is not what is being read. Nothing can verify a
+  directory against the repository it claims to hold, so the one case where the
+  configuration did not ask for it is called out.
+
+- `base_url` is no longer validated under `platform = "local"`. A malformed
+  endpoint inherited from the environment stopped a read that never leaves the
+  machine.
 
 - The warning about attributes the local platform ignores names only the
   attributes that were set, and only those from the configuration — an endpoint

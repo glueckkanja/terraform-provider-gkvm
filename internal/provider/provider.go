@@ -171,10 +171,11 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		)
 	}
 
-	// A left-over github_* attribute on GitLab is not a harmless alias:
-	// github_token would hand a GitHub credential to the GitLab host. The
-	// local backend has no host and no credential, so it only warns.
-	if platform == PlatformGitLab {
+	// A left-over github_* attribute on another API platform is not a harmless
+	// alias: github_token would hand a GitHub credential to that host. Only the
+	// local platform is exempt — no host, no credential — so a platform added
+	// later is guarded without anyone remembering to add it here.
+	if platform != PlatformGitHub && platform != PlatformLocal {
 		for name, value := range map[string]types.String{
 			"github_repo":  config.GithubRepo,
 			"github_ref":   config.GithubRef,
@@ -223,7 +224,10 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 	// The endpoint is resolved before the token: which credential store the
 	// platform CLI is asked for depends on the host being addressed.
 	baseURL := firstNonEmpty(stringValue(config.BaseURL), os.Getenv(envBaseURL))
-	if baseURL != "" {
+	// Not validated for the local platform: it addresses no endpoint, and a
+	// malformed one inherited from the environment must not stop a read that
+	// never leaves the machine.
+	if baseURL != "" && platform != PlatformLocal {
 		if err := source.ValidateBaseURL(baseURL); err != nil {
 			resp.Diagnostics.AddError("Invalid provider configuration", err.Error())
 			return
@@ -237,6 +241,16 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 
 	switch platform {
 	case PlatformLocal:
+		// Nothing proves the directory holds what this configuration asked
+		// for. When the environment made that choice rather than the
+		// configuration, say so: the repository named here is not being read.
+		if stringValue(config.LocalDir) == "" && (stringValue(config.Repository) != "" || stringValue(config.GithubRepo) != "") {
+			resp.Diagnostics.AddWarning(
+				"Profiles read from a directory, not the configured repository",
+				fmt.Sprintf("%s selected a local profile directory, so %q at %q is not read and nothing verifies that the directory holds it. Unset the variable to read the repository.",
+					envLocalDir, repository, ref),
+			)
+		}
 		// No token is resolved: nothing here reaches the network, and the
 		// platform CLI would otherwise be run once per reader for nothing.
 		warnIgnoredByLocal(resp, map[string]string{
@@ -282,10 +296,10 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		return
 	}
 
-	// The probe gets no waiting budget: it only answers "is this reachable",
-	// and one provider instance per unit each sleeping out a limit here turns
-	// a fast red into an hour of waiting.
-	if err := client.Ping(source.WithRateLimitBudget(ctx, 0)); err != nil {
+	// A small budget, not the read's: the probe runs once per process, so a
+	// long wait multiplies by the unit count, while a concurrency burst from
+	// those same processes clears in a moment.
+	if err := client.Ping(source.WithRateLimitBudget(ctx, source.ProbeWaitBudget)); err != nil {
 		title := "Failed to connect to the repository"
 		if platform == PlatformLocal {
 			title = "Failed to read the local profile directory"

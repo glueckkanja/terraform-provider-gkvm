@@ -631,13 +631,14 @@ func TestClassifyThrottle(t *testing.T) {
 			wantWait:    600 * time.Second,
 			exactWait:   true,
 		},
+		// A reset in the past is a skewed clock or a stale proxy header. Taking
+		// it at face value would fire all five attempts within milliseconds at
+		// an active limiter.
 		{
-			name:        "a reset already in the past may be retried at once",
+			name:        "a reset already in the past backs off instead",
 			status:      http.StatusTooManyRequests,
 			header:      header(map[string]string{"X-RateLimit-Reset": strconv.FormatInt(time.Now().Add(-time.Minute).Unix(), 10)}),
 			wantLimited: true,
-			wantWait:    0,
-			exactWait:   true,
 		},
 	}
 
@@ -871,5 +872,43 @@ func TestGet_AProbeWithNoBudgetFailsAtOnce(t *testing.T) {
 	// It must not claim an earlier request spent the budget: there was none.
 	if strings.Contains(err.Error(), "already spent") {
 		t.Errorf("error %q blames requests that never happened", err)
+	}
+}
+
+// A limit asking for no wait is a free retry. Refusing it for want of budget
+// would spend nothing and still fail — which is what the probe used to do.
+func TestGet_TakesAFreeRetryEvenWithNoBudget(t *testing.T) {
+	fastRetries(t)
+	var calls atomic.Int32
+	r := newTestRequester(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	ctx := WithRateLimitBudget(context.Background(), 0)
+	if _, err := r.Get(ctx, r.Base()+"/anything", "application/json"); err != nil {
+		t.Fatalf("a free retry was refused: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("calls = %d, want 2", got)
+	}
+}
+
+// The probe budget clears a concurrency burst — many processes starting at
+// once — without being able to sit out a real limit.
+func TestProbeWaitBudget_CoversABurstButNotALimit(t *testing.T) {
+	ctx := WithRateLimitBudget(context.Background(), ProbeWaitBudget)
+	if !takeWait(ctx, 2*time.Second).fits {
+		t.Error("a two second burst wait did not fit the probe budget")
+	}
+	if takeWait(ctx, 60*time.Second).fits {
+		t.Error("a minute-long limit fit the probe budget")
+	}
+	if ProbeWaitBudget >= ReadWaitBudget {
+		t.Errorf("ProbeWaitBudget %v is not smaller than ReadWaitBudget %v", ProbeWaitBudget, ReadWaitBudget)
 	}
 }
