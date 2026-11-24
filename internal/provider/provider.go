@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"github.com/glueckkanja/terraform-provider-gkvm/internal/github"
 	"github.com/glueckkanja/terraform-provider-gkvm/internal/gitlab"
+	"github.com/glueckkanja/terraform-provider-gkvm/internal/local"
 	"github.com/glueckkanja/terraform-provider-gkvm/internal/source"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
@@ -21,6 +23,7 @@ import (
 const (
 	PlatformGitHub = "github"
 	PlatformGitLab = "gitlab"
+	PlatformLocal  = local.Platform
 )
 
 // Environment variables the provider reads, in the order it reads them.
@@ -28,6 +31,7 @@ const (
 // the nosec annotations on the token-shaped names.
 const (
 	envBaseURL     = "GKVM_BASE_URL"
+	envLocalDir    = "GKVM_LOCAL_DIR"
 	envToken       = "GKVM_TOKEN"   //nolint:gosec // holds the name of an environment variable, not a credential
 	envGHToken     = "GH_TOKEN"     //nolint:gosec // holds the name of an environment variable, not a credential
 	envGitHubToken = "GITHUB_TOKEN" //nolint:gosec // holds the name of an environment variable, not a credential
@@ -47,6 +51,7 @@ type gkvmProviderModel struct {
 	Repository types.String `tfsdk:"repository"`
 	Ref        types.String `tfsdk:"ref"`
 	Token      types.String `tfsdk:"token"`
+	LocalDir   types.String `tfsdk:"local_dir"`
 
 	// The GitHub-only spellings of v0.1.x, kept working and marked deprecated
 	// in the schema.
@@ -73,11 +78,11 @@ func (p *GkvmProvider) Metadata(_ context.Context, _ provider.MetadataRequest, r
 
 func (p *GkvmProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "GKVM platform provider — reads content from a Git repository for glueckkanja verified modules. Supports GitHub (including GitHub Enterprise Cloud and Enterprise Server) and GitLab (including self-managed instances).",
+		Description: "GKVM platform provider — reads content from a Git repository for glueckkanja verified modules. Supports GitHub (including GitHub Enterprise Cloud and Enterprise Server), GitLab (including self-managed instances), and a directory on disk.",
 		Attributes: map[string]schema.Attribute{
 			"platform": schema.StringAttribute{
 				Optional:    true,
-				Description: "Repository platform to read from: \"github\" (default) or \"gitlab\".",
+				Description: "Repository platform to read from: \"github\" (default), \"gitlab\", or \"local\" to read " + envLocalDir + " / local_dir instead of an API.",
 			},
 			"base_url": schema.StringAttribute{
 				Optional: true,
@@ -100,6 +105,12 @@ func (p *GkvmProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp 
 				Description: "Access token with read access to the repository contents. Resolved from " + envToken + ", then platform-specific environment variables, then the platform CLI when unset. " +
 					"GitHub: " + envGHToken + ", " + envGitHubToken + ", then 'gh auth token'. GitLab: " + envGitLabToken + ", then 'glab auth token'. " +
 					"A GitLab CI job token cannot be used — GitLab's job token allowlist does not cover the repository tree endpoint needed to discover profiles.",
+			},
+			"local_dir": schema.StringAttribute{
+				Optional: true,
+				Description: "Absolute path of a directory holding the repository content, read instead of the API. Falls back to the " + envLocalDir + " environment variable, " +
+					"and setting either one selects platform \"local\" unless platform says otherwise. Reads become local file I/O: no requests, no rate limit and no token. " +
+					"Use it where one run reads the profiles many times over — a CI job that already has the content on disk serves every reader from it.",
 			},
 
 			"github_repo": schema.StringAttribute{
@@ -129,21 +140,59 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		return
 	}
 
+	if config.Platform.IsUnknown() {
+		resp.Diagnostics.AddError(
+			"Invalid provider configuration",
+			"platform is not known at plan time. It decides whether the profiles are read from an API or from a directory, so it has to be a literal.",
+		)
+		return
+	}
 	platform := strings.ToLower(strings.TrimSpace(stringValue(config.Platform)))
+	// Each candidate is trimmed before the fallback, not after: a blank-but-set
+	// value would otherwise shadow a good one and then read as unset.
+	localDir, localDirBlank := resolveLocalDir(config.LocalDir)
+
+	// The environment selects the local backend on its own, so a CI job can
+	// switch a generated configuration it cannot edit. An explicit platform wins.
+	if platform == "" && localDir != "" {
+		platform = PlatformLocal
+	}
 	if platform == "" {
 		platform = PlatformGitHub
 	}
-	if platform != PlatformGitHub && platform != PlatformGitLab {
+	if platform != PlatformGitHub && platform != PlatformGitLab && platform != PlatformLocal {
 		resp.Diagnostics.AddError(
 			"Invalid provider configuration",
-			fmt.Sprintf("platform %q is not supported — use %q or %q.", platform, PlatformGitHub, PlatformGitLab),
+			fmt.Sprintf("platform %q is not supported — use %q, %q or %q.", platform, PlatformGitHub, PlatformGitLab, PlatformLocal),
 		)
 		return
 	}
 
-	// A left-over github_* attribute on another platform is not a harmless
-	// alias: github_token would hand a GitHub credential to the GitLab host.
-	if platform != PlatformGitHub {
+	// A set-but-blank value is the silent version of the failure this backend
+	// exists to remove: every reader quietly goes back to the API.
+	if localDirBlank {
+		resp.Diagnostics.AddError(
+			"Invalid provider configuration",
+			fmt.Sprintf("%s or local_dir is set but holds only whitespace. Unset it to read the API, or give it the directory to read.", envLocalDir),
+		)
+		return
+	}
+
+	// The mirror of the warning the local platform emits: an operator who
+	// exports GKVM_LOCAL_DIR to escape a rate limit must not be left guessing
+	// why one root still reads the API.
+	if platform != PlatformLocal && localDir != "" {
+		resp.Diagnostics.AddWarning(
+			"Local profile directory ignored",
+			fmt.Sprintf("A local profile directory is set but platform is %q, so the profiles are read from the API. Remove the platform attribute to read the directory instead.", platform),
+		)
+	}
+
+	// A left-over github_* attribute on another API platform is not a harmless
+	// alias: github_token would hand a GitHub credential to that host. Only the
+	// local platform is exempt — no host, no credential — so a platform added
+	// later is guarded without anyone remembering to add it here.
+	if platform != PlatformGitHub && platform != PlatformLocal {
 		for name, value := range map[string]types.String{
 			"github_repo":  config.GithubRepo,
 			"github_ref":   config.GithubRef,
@@ -164,7 +213,9 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		resp.Diagnostics.AddError("Invalid provider configuration", err.Error())
 		return
 	}
-	if repository == "" {
+	// The local backend reads a directory; a repository is optional there and
+	// only names what the directory should hold.
+	if repository == "" && platform != PlatformLocal {
 		resp.Diagnostics.AddError(
 			"Invalid provider configuration",
 			"repository must be set — the repository to read profiles from, e.g. \"owner/repo\" on GitHub or \"group/project\" on GitLab.",
@@ -190,7 +241,10 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 	// The endpoint is resolved before the token: which credential store the
 	// platform CLI is asked for depends on the host being addressed.
 	baseURL := firstNonEmpty(stringValue(config.BaseURL), os.Getenv(envBaseURL))
-	if baseURL != "" {
+	// Not validated for the local platform: it addresses no endpoint, and a
+	// malformed one inherited from the environment must not stop a read that
+	// never leaves the machine.
+	if baseURL != "" && platform != PlatformLocal {
 		if err := source.ValidateBaseURL(baseURL); err != nil {
 			resp.Diagnostics.AddError("Invalid provider configuration", err.Error())
 			return
@@ -203,6 +257,29 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 	)
 
 	switch platform {
+	case PlatformLocal:
+		// Nothing proves the directory holds what this configuration asked
+		// for. When the environment made that choice rather than the
+		// configuration, say so: the repository named here is not being read.
+		if stringValue(config.LocalDir) == "" && (stringValue(config.Repository) != "" || stringValue(config.GithubRepo) != "") {
+			resp.Diagnostics.AddWarning(
+				"Profiles read from a directory, not the configured repository",
+				fmt.Sprintf("%s selected a local profile directory, so %q at %q is not read and nothing verifies that the directory holds it. Unset the variable to read the repository.",
+					envLocalDir, repository, ref),
+			)
+		}
+		// No token is resolved: nothing here reaches the network, and the
+		// platform CLI would otherwise be run once per reader for nothing.
+		warnIgnoredByLocal(resp, map[string]string{
+			"base_url":     stringValue(config.BaseURL),
+			"token":        stringValue(config.Token),
+			"github_token": stringValue(config.GithubToken),
+		})
+		client = &local.Client{
+			Dir:        localDir,
+			Repository: repository,
+			Ref:        ref,
+		}
 	case PlatformGitLab:
 		endpoint = gitlab.NormalizeBaseURL(baseURL)
 		token := resolveGitLabToken(ctx, configuredToken, endpoint)
@@ -236,10 +313,16 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		return
 	}
 
-	// Validate connectivity with a lightweight repository check (fail-fast).
-	if err := client.Ping(ctx); err != nil {
+	// A small budget, not the read's: the probe runs once per process, so a
+	// long wait multiplies by the unit count, while a concurrency burst from
+	// those same processes clears in a moment.
+	if err := client.Ping(source.WithRateLimitBudget(ctx, source.ProbeWaitBudget)); err != nil {
+		title := "Failed to connect to the repository"
+		if platform == PlatformLocal {
+			title = "Failed to read the local profile directory"
+		}
 		resp.Diagnostics.AddError(
-			"Failed to connect to the repository",
+			title,
 			fmt.Sprintf("Platform: %s\nEndpoint: %s\nRepository: %s\nRef: %s\nError: %s",
 				platform, client.Endpoint(), client.Subject(), client.Reference(), err.Error()),
 		)
@@ -247,6 +330,58 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 	}
 
 	resp.DataSourceData = &providerData{Client: client}
+}
+
+// resolveLocalDir reads the local directory from the configuration, then the
+// environment, trimming each candidate. It reports separately that a candidate
+// was present but blank, which must not pass as "not configured".
+func resolveLocalDir(configured types.String) (dir string, blank bool) {
+	fromConfig := stringValue(configured)
+	fromEnv, envSet := os.LookupEnv(envLocalDir)
+
+	for _, candidate := range []struct {
+		value string
+		set   bool
+	}{
+		{fromConfig, fromConfig != ""},
+		{fromEnv, envSet},
+	} {
+		if trimmed := strings.TrimSpace(candidate.value); trimmed != "" {
+			return trimmed, false
+		}
+		if candidate.set {
+			blank = true
+		}
+	}
+	return "", blank
+}
+
+// warnIgnoredByLocal reports attributes the local backend has no use for. It
+// warns rather than fails: the configuration it reads was written for the API.
+func warnIgnoredByLocal(resp *provider.ConfigureResponse, values map[string]string) {
+	ignored := make([]string, 0, len(values))
+	for name, value := range values {
+		if value != "" {
+			ignored = append(ignored, name)
+		}
+	}
+	if len(ignored) == 0 {
+		return
+	}
+	sort.Strings(ignored)
+	resp.Diagnostics.AddWarning(
+		"Attributes ignored by the local platform",
+		fmt.Sprintf("%s %s set but the local platform reads a directory: no request is made and no token is sent. Remove them, or set platform explicitly to read the API instead.",
+			strings.Join(ignored, ", "), plural(len(ignored))),
+	)
+}
+
+// plural picks the verb for a list of n names.
+func plural(n int) string {
+	if n == 1 {
+		return "is"
+	}
+	return "are"
 }
 
 // resolveGitHubToken returns the first token it can find, in order:

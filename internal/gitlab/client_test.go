@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/glueckkanja/terraform-provider-gkvm/internal/source"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestNormalizeBaseURL(t *testing.T) {
@@ -244,5 +247,57 @@ func TestEndpointSubjectReference(t *testing.T) {
 	}
 	if c.Subject() != "group/project" || c.Reference() != "v1" {
 		t.Errorf("Subject()/Reference() = %q/%q", c.Subject(), c.Reference())
+	}
+}
+
+// The rate-limit classification and the read budget live in the shared
+// requester, so GitLab gets them too — including its paginated listing, where
+// a per-request budget would multiply by the number of pages.
+func TestGitLab_SharesTheReadBudgetAcrossPages(t *testing.T) {
+	var calls atomic.Int32
+	client, _ := newMockClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		// GitLab's own throttling answer: 429 with a wait.
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "retry later", http.StatusTooManyRequests)
+	}))
+
+	ctx := source.WithRateLimitBudget(context.Background(), 2*time.Second)
+	start := time.Now()
+	_, err := client.ListDirectory(ctx, "defaults")
+	if err == nil {
+		t.Fatal("expected the throttling to be reported")
+	}
+	// One 2 s wait fits the budget, the next request finds nothing left: two
+	// calls, not the full five attempts.
+	if got := calls.Load(); got != 2 {
+		t.Errorf("calls = %d, want 2", got)
+	}
+	if elapsed := time.Since(start); elapsed > 6*time.Second {
+		t.Errorf("listing took %v; the budget did not bound it", elapsed)
+	}
+	if !strings.Contains(err.Error(), "rate limited") {
+		t.Errorf("error %q does not name the rate limit", err)
+	}
+}
+
+// A GitLab 403 carrying no rate-limit evidence stays a permission problem, the
+// same asymmetry the GitHub backend keeps.
+func TestGitLab_PermissionForbiddenIsNotRetried(t *testing.T) {
+	var calls atomic.Int32
+	client, _ := newMockClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "insufficient_scope", http.StatusForbidden)
+	}))
+
+	_, err := client.ListDirectory(context.Background(), "defaults")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("calls = %d, want 1", got)
+	}
+	if !strings.Contains(err.Error(), "token permissions") {
+		t.Errorf("error %q does not point at the token", err)
 	}
 }

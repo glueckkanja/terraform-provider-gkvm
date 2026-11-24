@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,11 +26,70 @@ const maxRedirects = 5
 
 // Retry bounds for transient failures. A single 5xx from the API used to fail a
 // whole plan: every unit reads the profiles, so one blip anywhere turned the run
-// red. Permanent answers (4xx other than 429) are never retried.
+// red. Permanent answers are never retried.
 const (
 	maxAttempts     = 5
 	retryAfterLimit = 10 * time.Second
 )
+
+// rateLimitWaitLimit is the default waiting budget for a rate limit, used as
+// the whole-read allowance and as the answer when no budget is installed. It is
+// not a per-attempt cap: one attempt may spend all of it, which is deliberate —
+// a secondary limit asks for about a minute and waiting it out once beats
+// failing, while the budget stops the next thirty requests doing the same.
+const rateLimitWaitLimit = 90 * time.Second
+
+// ReadWaitBudget is the total a read of many files may spend waiting out rate
+// limits. A limit that needs longer will not lift inside the read either.
+const ReadWaitBudget = rateLimitWaitLimit
+
+// ProbeWaitBudget is what a reachability check may spend. Small on purpose —
+// the check runs once per process, so it multiplies by the number of units —
+// but it has to cover the plain backoff ladder of 0.5+1+2+4 = 7.5 s, or a
+// throttled probe would lose an attempt it used to get.
+const ProbeWaitBudget = 15 * time.Second
+
+// budget is the wall clock one read may spend waiting out rate limits. It is
+// shared, so a read of many files cannot spend the bound once per request.
+type budget struct {
+	mu        sync.Mutex
+	total     time.Duration
+	remaining time.Duration
+}
+
+type budgetKey struct{}
+
+// WithRateLimitBudget gives every request made under ctx one shared waiting
+// budget. A read of many files needs this; a single request gets its own.
+func WithRateLimitBudget(ctx context.Context, total time.Duration) context.Context {
+	return context.WithValue(ctx, budgetKey{}, &budget{total: total, remaining: total})
+}
+
+// waiting is the outcome of asking a budget to cover one wait. The three
+// refusals are different things to act on: a budget that never allowed any
+// waiting, one spent by earlier requests, and a limit simply too long.
+type waiting struct {
+	fits      bool
+	available time.Duration
+	total     time.Duration
+}
+
+// takeWait reserves a wait from the budget in ctx.
+func takeWait(ctx context.Context, d time.Duration) waiting {
+	b, ok := ctx.Value(budgetKey{}).(*budget)
+	if !ok {
+		return waiting{fits: d <= rateLimitWaitLimit, available: rateLimitWaitLimit, total: rateLimitWaitLimit}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := waiting{available: b.remaining, total: b.total}
+	if d > b.remaining {
+		return state
+	}
+	b.remaining -= d
+	state.fits = true
+	return state
+}
 
 // Delays are variables so tests can shrink them; production never changes them.
 var (
@@ -255,6 +315,11 @@ func (r *Requester) onEndpoint(rawURL string) bool {
 // Get fetches a URL on the configured endpoint and returns the response body,
 // retrying transient failures with a bounded backoff.
 func (r *Requester) Get(ctx context.Context, requestURL, accept string) ([]byte, error) {
+	// A request outside a read still needs a bound, or a sustained limit would
+	// let one call sleep the per-attempt cap four times over.
+	if _, ok := ctx.Value(budgetKey{}).(*budget); !ok {
+		ctx = WithRateLimitBudget(ctx, rateLimitWaitLimit)
+	}
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		body, delay, retryable, err := r.get(ctx, requestURL, accept, attempt)
@@ -303,6 +368,75 @@ func retryAfter(header string, attempt int) time.Duration {
 		return retryAfterLimit
 	}
 	return backoff(attempt)
+}
+
+// throttle describes a throttling answer from the API.
+type throttle struct {
+	// limited: a rate-limit answer rather than a permission or server error.
+	limited bool
+	// wait: how long the response asks the caller to hold off.
+	wait time.Duration
+}
+
+// rateLimitHeaders are the remaining-request counters of both platforms.
+// Header.Get is case-insensitive, the X- prefix is not.
+var rateLimitHeaders = []string{"X-RateLimit-Remaining", "RateLimit-Remaining"}
+
+// classifyThrottle decides whether a non-OK response is throttling. 429 is
+// unambiguous; a 403 is GitHub's answer to both a secondary rate limit and a
+// token that may not read, told apart by Retry-After or an exhausted counter.
+func classifyThrottle(status int, header http.Header, attempt int) throttle {
+	limited := status == http.StatusTooManyRequests
+	if status == http.StatusForbidden {
+		limited = header.Get("Retry-After") != "" || exhausted(header)
+	}
+	if !limited {
+		return throttle{}
+	}
+
+	wait, explicit := requestedWait(header)
+	if !explicit {
+		// No hint on how long: back off rather than guess at the window.
+		return throttle{limited: true, wait: backoff(attempt)}
+	}
+	return throttle{limited: true, wait: wait}
+}
+
+// exhausted reports whether a remaining-request counter is present and at
+// zero. A counter the platform did not send is not evidence of anything.
+func exhausted(header http.Header) bool {
+	for _, name := range rateLimitHeaders {
+		if value := header.Get(name); value != "" {
+			// Exactly zero. Some proxies send -1 for "no limit", and treating
+			// that as exhausted would reclassify every permission 403 as
+			// throttling — the mis-blame this classification exists to remove.
+			if remaining, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && remaining == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// requestedWait reads the wait the response asks for, from Retry-After
+// (relative) or a rate-limit reset (epoch), and whether it said anything.
+func requestedWait(header http.Header) (time.Duration, bool) {
+	if seconds, err := strconv.Atoi(strings.TrimSpace(header.Get("Retry-After"))); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second, true
+	}
+	for _, name := range []string{"X-RateLimit-Reset", "RateLimit-Reset"} {
+		if value := header.Get(name); value != "" {
+			if epoch, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
+				// A reset in the past is a skewed clock or a stale proxy
+				// header, not permission to hammer an active limiter.
+				if d := time.Until(time.Unix(epoch, 0)); d > 0 {
+					return d, true
+				}
+				return 0, false
+			}
+		}
+	}
+	return 0, false
 }
 
 // get performs one request. It reports whether the failure is worth retrying
@@ -370,21 +504,53 @@ func (r *Requester) get(ctx context.Context, requestURL, accept string, attempt 
 	if resp.StatusCode != http.StatusOK {
 		// Sanitize: include status code and subject but NOT the response body,
 		// which may carry tokens or internal details from proxies.
-		hint := ""
-		switch resp.StatusCode {
-		case http.StatusUnauthorized:
+		var (
+			hint      string
+			retryable bool
+			delay     time.Duration
+		)
+
+		// Throttling first: it is the one condition a status code alone
+		// cannot name, because 403 serves double duty.
+		t := classifyThrottle(resp.StatusCode, resp.Header, attempt)
+		// Reserved only when a wait can still follow: the last attempt never
+		// sleeps, so charging the budget there would misreport the remainder
+		// to whichever request comes next.
+		var wait waiting
+		if t.limited && attempt < maxAttempts {
+			wait = takeWait(ctx, t.wait)
+		}
+		switch {
+		case t.limited && attempt == maxAttempts:
+			hint = fmt.Sprintf(" (rate limited for %s; gave up after %d attempts)",
+				t.wait.Round(time.Second), maxAttempts)
+		// Checked before the refusals: a limit asking for no wait at all is a
+		// free retry, and refusing it for want of budget spends nothing to fail.
+		case t.limited && wait.fits:
+			hint = fmt.Sprintf(" (rate limited; waiting %s before attempt %d of %d)",
+				t.wait.Round(time.Millisecond), attempt+1, maxAttempts)
+			retryable, delay = true, t.wait
+		// Only a caller that installs a zero budget reaches this; neither
+		// ReadWaitBudget nor ProbeWaitBudget does. Kept so such a caller gets
+		// a true message rather than one blaming earlier requests.
+		case t.limited && wait.total <= 0:
+			hint = fmt.Sprintf(" (rate limited for %s; this caller does not wait a limit out)", t.wait.Round(time.Second))
+		case t.limited && wait.available <= 0:
+			hint = " (rate limited, and this read has already spent its waiting budget on earlier requests — bundle the content or use a token with a higher limit)"
+		case t.limited:
+			hint = fmt.Sprintf(" (rate limited and the limit does not lift for %s, more than the %s this read may still wait — spread the reads out, bundle them, or use a token with a higher limit)",
+				t.wait.Round(time.Second), wait.available.Round(time.Second))
+		case resp.StatusCode >= 500:
+			retryable = true
+			delay = retryAfter(resp.Header.Get("Retry-After"), attempt)
+		case resp.StatusCode == http.StatusUnauthorized:
 			hint = " (check that the token is valid, unexpired, and issued by this endpoint)"
-		case http.StatusForbidden:
+		case resp.StatusCode == http.StatusForbidden:
 			hint = " (check token permissions — read access to the repository contents is required)"
-		case http.StatusNotFound:
+		case resp.StatusCode == http.StatusNotFound:
 			hint = " (check that the endpoint, repository, ref, and path exist — a token without read access also reports 404)"
 		}
-		// 5xx is the server failing, 429 is throttling: both are worth another go.
-		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
-		delay := time.Duration(0)
-		if retryable {
-			delay = retryAfter(resp.Header.Get("Retry-After"), attempt)
-		}
+
 		return nil, delay, retryable, fmt.Errorf("%s API at %s returned HTTP %d for %s%s",
 			r.Platform, r.Base(), resp.StatusCode, r.Subject, hint)
 	}
