@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] — Read profiles from a directory
 
 ### Added
 
