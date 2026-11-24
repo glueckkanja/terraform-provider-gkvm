@@ -341,3 +341,46 @@ func TestClient_ReportsAnUnresolvablePath(t *testing.T) {
 		t.Errorf("error %q does not report an unresolvable path", err)
 	}
 }
+
+// A symlink to a directory reports as a file through the dirent alone, and the
+// profile fetcher would then try to read it instead of skipping it.
+func TestClient_ReportsASymlinkedDirectoryAsADirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on Windows")
+	}
+
+	root := newDir(t, map[string]string{"real/vm.yaml": "a: 1\n", "defaults/keep.yaml": "a: 1\n"})
+	if err := os.Symlink(filepath.Join(root, "real"), filepath.Join(root, "defaults", "link")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	entries, err := (&Client{Dir: root}).ListDirectory(context.Background(), "defaults")
+	if err != nil {
+		t.Fatalf("ListDirectory: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name == "link" && !e.IsDir {
+			t.Error("a symlinked directory was reported as a file")
+		}
+	}
+}
+
+// A cancelled plan must stop the read between files, even though a blocked
+// syscall inside one cannot be interrupted.
+func TestClient_HonoursCancellation(t *testing.T) {
+	root := newDir(t, map[string]string{"defaults/vm.yaml": "a: 1\n"})
+	c := &Client{Dir: root}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := c.ListDirectory(ctx, "defaults"); err == nil {
+		t.Error("ListDirectory ignored a cancelled context")
+	}
+	if _, err := c.FetchFile(ctx, "defaults/vm.yaml"); err == nil {
+		t.Error("FetchFile ignored a cancelled context")
+	}
+	if err := c.Ping(ctx); err == nil {
+		t.Error("Ping ignored a cancelled context")
+	}
+}

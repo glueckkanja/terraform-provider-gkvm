@@ -75,6 +75,33 @@
   platform already emitted for `base_url` and `token`. Silently reading the API
   is the failure mode this backend exists to remove.
 
+- `local_dir` and `GKVM_LOCAL_DIR` are trimmed **per candidate**, so a blank
+  attribute no longer shadows a usable variable, and a value holding only
+  whitespace is an error rather than a silent return to the API. A workflow
+  writing `GKVM_LOCAL_DIR=` from a skipped step used to send every reader back
+  to the REST API with no diagnostic at all.
+
+- A `platform` that is unknown at plan time is an error. It decided whether the
+  profiles come from an API or a directory, and an unknown value read as unset —
+  which let the environment override a configuration that insists on the API.
+
+- A rate-limit counter of exactly zero counts as exhausted. Some proxies send
+  `-1` for "no limit", and treating that as exhausted reclassified every
+  permission 403 as throttling — the mis-blame in reverse.
+
+- `ListDirectory` resolves an entry's kind through a symlink, so a link to a
+  directory is reported as one. Reported as a file it was handed to the file
+  read, which refused it and failed the whole profile read.
+
+- The local backend observes a cancelled context between reads. A blocked
+  syscall on a stale mount still cannot be interrupted, but a cancelled plan no
+  longer reads the rest of the directory first.
+
+- The reachability check's budget is 15 s rather than 5 s. Five seconds is
+  below the plain backoff ladder of 0.5+1+2+4 = 7.5 s, so a throttled probe lost
+  an attempt it used to get, and a `Retry-After` between 5 s and 10 s failed
+  where the previous release waited and recovered.
+
 - `local_dir` and `GKVM_LOCAL_DIR` are trimmed. A trailing newline — what
   `echo "X=$dir" >> $GITHUB_ENV` produces — selected the local platform and
   then failed on a character invisible in the diagnostic.

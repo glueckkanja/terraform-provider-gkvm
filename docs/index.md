@@ -259,7 +259,8 @@ exactly as before.
   contents. Resolved from the environment or the platform CLI when unset.
   Ignored by `platform = "local"`, which resolves no token at all.
 - `local_dir` (String) Absolute path of a directory holding the repository
-  content, read instead of the API. Falls back to the `GKVM_LOCAL_DIR`
+  content, read instead of the API. A value holding only whitespace is an
+  error, not a silent fallback to the API. Falls back to the `GKVM_LOCAL_DIR`
   environment variable, and setting either one selects `platform = "local"`
   unless `platform` says otherwise.
 - `github_repo` (String, **Deprecated**) Use `repository`.

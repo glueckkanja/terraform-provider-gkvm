@@ -32,19 +32,22 @@ const (
 	retryAfterLimit = 10 * time.Second
 )
 
-// rateLimitWaitLimit bounds how long one attempt waits out a rate limit. It is
-// higher than retryAfterLimit: a limit lifts only when its window moves.
+// rateLimitWaitLimit is the default waiting budget for a rate limit, used as
+// the whole-read allowance and as the answer when no budget is installed. It is
+// not a per-attempt cap: one attempt may spend all of it, which is deliberate —
+// a secondary limit asks for about a minute and waiting it out once beats
+// failing, while the budget stops the next thirty requests doing the same.
 const rateLimitWaitLimit = 90 * time.Second
 
 // ReadWaitBudget is the total a read of many files may spend waiting out rate
 // limits. A limit that needs longer will not lift inside the read either.
 const ReadWaitBudget = rateLimitWaitLimit
 
-// ProbeWaitBudget is what a reachability check may spend. It is small on
-// purpose: the check runs once per process, so a long wait multiplies by the
-// number of units, but a concurrency burst clears in a second or two and
-// failing on that would be the re-run-required failure retrying removed.
-const ProbeWaitBudget = 5 * time.Second
+// ProbeWaitBudget is what a reachability check may spend. Small on purpose —
+// the check runs once per process, so it multiplies by the number of units —
+// but it has to cover the plain backoff ladder of 0.5+1+2+4 = 7.5 s, or a
+// throttled probe would lose an attempt it used to get.
+const ProbeWaitBudget = 15 * time.Second
 
 // budget is the wall clock one read may spend waiting out rate limits. It is
 // shared, so a read of many files cannot spend the bound once per request.
@@ -404,7 +407,10 @@ func classifyThrottle(status int, header http.Header, attempt int) throttle {
 func exhausted(header http.Header) bool {
 	for _, name := range rateLimitHeaders {
 		if value := header.Get(name); value != "" {
-			if remaining, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && remaining <= 0 {
+			// Exactly zero. Some proxies send -1 for "no limit", and treating
+			// that as exhausted would reclassify every permission 403 as
+			// throttling — the mis-blame this classification exists to remove.
+			if remaining, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && remaining == 0 {
 				return true
 			}
 		}
@@ -507,8 +513,11 @@ func (r *Requester) get(ctx context.Context, requestURL, accept string, attempt 
 		// Throttling first: it is the one condition a status code alone
 		// cannot name, because 403 serves double duty.
 		t := classifyThrottle(resp.StatusCode, resp.Header, attempt)
+		// Reserved only when a wait can still follow: the last attempt never
+		// sleeps, so charging the budget there would misreport the remainder
+		// to whichever request comes next.
 		var wait waiting
-		if t.limited {
+		if t.limited && attempt < maxAttempts {
 			wait = takeWait(ctx, t.wait)
 		}
 		switch {
@@ -521,8 +530,11 @@ func (r *Requester) get(ctx context.Context, requestURL, accept string, attempt 
 			hint = fmt.Sprintf(" (rate limited; waiting %s before attempt %d of %d)",
 				t.wait.Round(time.Millisecond), attempt+1, maxAttempts)
 			retryable, delay = true, t.wait
+		// Only a caller that installs a zero budget reaches this; neither
+		// ReadWaitBudget nor ProbeWaitBudget does. Kept so such a caller gets
+		// a true message rather than one blaming earlier requests.
 		case t.limited && wait.total <= 0:
-			hint = fmt.Sprintf(" (rate limited for %s; this check does not wait a limit out)", t.wait.Round(time.Second))
+			hint = fmt.Sprintf(" (rate limited for %s; this caller does not wait a limit out)", t.wait.Round(time.Second))
 		case t.limited && wait.available <= 0:
 			hint = " (rate limited, and this read has already spent its waiting budget on earlier requests — bundle the content or use a token with a higher limit)"
 		case t.limited:

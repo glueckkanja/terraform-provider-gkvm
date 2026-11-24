@@ -595,3 +595,77 @@ func TestConfigure_SilentWhenTheConfigurationChoseTheDirectory(t *testing.T) {
 		t.Errorf("warnings = %d, want 0: %s", n, diagnostics(resp))
 	}
 }
+
+// A variable set to whitespace is the silent version of the failure this
+// backend removes: every reader would quietly go back to the API.
+func TestConfigure_RejectsABlankLocalDir(t *testing.T) {
+	for _, value := range []string{"", "   ", "\n"} {
+		t.Setenv(envLocalDir, value)
+		resp := configureCtx(t, bounded(t), map[string]string{
+			"repository": "owner/repo",
+			"base_url":   unreachable,
+		})
+		if value == "" {
+			// Unset-like: the API path is correct, and it must not be claimed
+			// that a directory was ignored.
+			for _, w := range resp.Diagnostics.Warnings() {
+				if strings.Contains(w.Summary(), "directory ignored") {
+					t.Errorf("empty value produced %q", w.Summary())
+				}
+			}
+			continue
+		}
+		if !resp.Diagnostics.HasError() {
+			t.Fatalf("%q was accepted", value)
+		}
+		if !strings.Contains(diagnostics(resp), "only whitespace") {
+			t.Errorf("diagnostics for %q do not name the blank value: %s", value, diagnostics(resp))
+		}
+	}
+}
+
+// A blank local_dir in the configuration must not shadow a good variable.
+func TestConfigure_BlankAttributeDoesNotShadowTheEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(envLocalDir, dir)
+
+	resp := configureCtx(t, bounded(t), map[string]string{
+		"repository": "owner/repo",
+		"base_url":   unreachable,
+		"local_dir":  "   ",
+	})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("a blank attribute shadowed a usable variable: %s", diagnostics(resp))
+	}
+}
+
+// An unknown platform is not an unset one: treating it as unset would let the
+// environment select the backend against a configuration that insists on an API.
+func TestConfigure_RejectsAnUnknownPlatform(t *testing.T) {
+	t.Setenv(envToken, "dummy-token")
+	t.Setenv(envLocalDir, t.TempDir())
+
+	s := providerSchema(t)
+	objType, ok := s.Type().TerraformType(context.Background()).(tftypes.Object)
+	if !ok {
+		t.Fatal("provider schema is not an object type")
+	}
+	values := make(map[string]tftypes.Value, len(objType.AttributeTypes))
+	for name := range objType.AttributeTypes {
+		values[name] = tftypes.NewValue(tftypes.String, nil)
+	}
+	values["platform"] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	values["repository"] = tftypes.NewValue(tftypes.String, "owner/repo")
+
+	resp := &provider.ConfigureResponse{}
+	(&GkvmProvider{}).Configure(context.Background(),
+		provider.ConfigureRequest{Config: tfsdk.Config{Schema: s, Raw: tftypes.NewValue(objType, values)}},
+		resp)
+
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("an unknown platform was accepted")
+	}
+	if !strings.Contains(diagnostics(resp), "not known at plan time") {
+		t.Errorf("diagnostics do not explain the problem: %s", diagnostics(resp))
+	}
+}

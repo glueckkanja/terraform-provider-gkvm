@@ -62,7 +62,10 @@ func (c *Client) ValidateConfig() error {
 }
 
 // Ping verifies the directory exists and is readable.
-func (c *Client) Ping(_ context.Context) error {
+func (c *Client) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	info, err := os.Stat(c.Dir)
 	if err != nil {
 		return fmt.Errorf("local profile directory %q cannot be read: %w", c.Dir, err)
@@ -79,7 +82,10 @@ func (c *Client) Ping(_ context.Context) error {
 }
 
 // ListDirectory lists a directory below the root; the empty path means the root.
-func (c *Client) ListDirectory(_ context.Context, path string) ([]source.Entry, error) {
+func (c *Client) ListDirectory(ctx context.Context, path string) ([]source.Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	target, err := c.resolve(path)
 	if err != nil {
 		return nil, err
@@ -101,14 +107,20 @@ func (c *Client) ListDirectory(_ context.Context, path string) ([]source.Entry, 
 		entries = append(entries, source.Entry{
 			Name:  item.Name(),
 			Path:  entryPath,
-			IsDir: item.IsDir(),
+			IsDir: isDir(filepath.Join(target, item.Name()), item),
 		})
 	}
 	return entries, nil
 }
 
 // FetchFile returns the bytes of one file below the root.
-func (c *Client) FetchFile(_ context.Context, path string) ([]byte, error) {
+func (c *Client) FetchFile(ctx context.Context, path string) ([]byte, error) {
+	// Checked between files rather than during one: a blocked syscall on a
+	// stale mount cannot be interrupted, but a cancelled plan stops here
+	// instead of reading the rest of the directory.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	target, err := c.resolve(path)
 	if err != nil {
 		return nil, err
@@ -179,6 +191,16 @@ func (c *Client) resolve(path string) (string, error) {
 		return "", fmt.Errorf("%q below %s resolves outside the directory: %w", path, c.Dir, err)
 	}
 	return resolved, nil
+}
+
+// isDir reports whether an entry is a directory, following a link to one. The
+// dirent alone reports a symlinked directory as a file, which the API backends
+// do not — and a caller filtering on IsDir would then try to read it.
+func isDir(path string, entry os.DirEntry) bool {
+	if info, err := os.Stat(path); err == nil {
+		return info.IsDir()
+	}
+	return entry.IsDir() // Unresolvable, e.g. a dangling link: report what the directory says.
 }
 
 // kindOf names a non-regular file for an error message.

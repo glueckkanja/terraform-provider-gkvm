@@ -794,8 +794,10 @@ func TestGet_StopsRetryingWhenTheReadBudgetIsSpent(t *testing.T) {
 	if got := calls.Load(); got != 2 {
 		t.Errorf("calls = %d, want 2 (one retry, then the budget is spent)", got)
 	}
-	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Errorf("read took %v, which is not bounded by the budget", elapsed)
+	// 3 s of budget, one 2 s wait: anything near the old per-request bound
+	// (4 x 2 s) has to fail here, so the margin is small on purpose.
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Errorf("read took %v, want under 4s — the budget did not bound it", elapsed)
 	}
 	// 2 s was taken, 1 s is left, so the refusal names both numbers.
 	if !strings.Contains(err.Error(), "more than the 1s this read may still wait") {
@@ -972,9 +974,25 @@ func TestGet_ConcurrentReadsShareOneBudget(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Ten readers each honouring a 1 s Retry-After four times would be 40 s.
-	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Errorf("read took %v; the shared budget did not bound it", elapsed)
+	// Two seconds of budget covers two 1 s waits in total. Without sharing,
+	// ten readers would each take their own, so ~4 s of wall clock; the bound
+	// is set just above the shared figure to catch that.
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("read took %v, want under 3s — the budget was not shared", elapsed)
 	}
 	t.Logf("10 concurrent readers, %d requests, %v elapsed", calls.Load(), time.Since(start).Round(time.Millisecond))
+}
+
+// A proxy that sends -1 for "no limit" must not turn every permission 403 into
+// a rate limit — that is the mis-blame this classification exists to remove.
+func TestClassifyThrottle_NegativeCounterIsNotExhausted(t *testing.T) {
+	for _, value := range []string{"-1", "1"} {
+		got := classifyThrottle(http.StatusForbidden, header(map[string]string{"X-RateLimit-Remaining": value}), 1)
+		if got.limited {
+			t.Errorf("remaining=%s was read as throttling", value)
+		}
+	}
+	if got := classifyThrottle(http.StatusForbidden, header(map[string]string{"X-RateLimit-Remaining": "0"}), 1); !got.limited {
+		t.Error("remaining=0 was not read as throttling")
+	}
 }

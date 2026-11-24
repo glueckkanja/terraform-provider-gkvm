@@ -140,10 +140,17 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		return
 	}
 
+	if config.Platform.IsUnknown() {
+		resp.Diagnostics.AddError(
+			"Invalid provider configuration",
+			"platform is not known at plan time. It decides whether the profiles are read from an API or from a directory, so it has to be a literal.",
+		)
+		return
+	}
 	platform := strings.ToLower(strings.TrimSpace(stringValue(config.Platform)))
-	// Trimmed: a trailing newline from `echo "X=$dir" >> $GITHUB_ENV` would
-	// otherwise select this backend and then fail on an invisible character.
-	localDir := strings.TrimSpace(firstNonEmpty(stringValue(config.LocalDir), os.Getenv(envLocalDir)))
+	// Each candidate is trimmed before the fallback, not after: a blank-but-set
+	// value would otherwise shadow a good one and then read as unset.
+	localDir, localDirBlank := resolveLocalDir(config.LocalDir)
 
 	// The environment selects the local backend on its own, so a CI job can
 	// switch a generated configuration it cannot edit. An explicit platform wins.
@@ -157,6 +164,16 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 		resp.Diagnostics.AddError(
 			"Invalid provider configuration",
 			fmt.Sprintf("platform %q is not supported — use %q, %q or %q.", platform, PlatformGitHub, PlatformGitLab, PlatformLocal),
+		)
+		return
+	}
+
+	// A set-but-blank value is the silent version of the failure this backend
+	// exists to remove: every reader quietly goes back to the API.
+	if localDirBlank {
+		resp.Diagnostics.AddError(
+			"Invalid provider configuration",
+			fmt.Sprintf("%s or local_dir is set but holds only whitespace. Unset it to read the API, or give it the directory to read.", envLocalDir),
 		)
 		return
 	}
@@ -313,6 +330,30 @@ func (p *GkvmProvider) Configure(ctx context.Context, req provider.ConfigureRequ
 	}
 
 	resp.DataSourceData = &providerData{Client: client}
+}
+
+// resolveLocalDir reads the local directory from the configuration, then the
+// environment, trimming each candidate. It reports separately that a candidate
+// was present but blank, which must not pass as "not configured".
+func resolveLocalDir(configured types.String) (dir string, blank bool) {
+	fromConfig := stringValue(configured)
+	fromEnv, envSet := os.LookupEnv(envLocalDir)
+
+	for _, candidate := range []struct {
+		value string
+		set   bool
+	}{
+		{fromConfig, fromConfig != ""},
+		{fromEnv, envSet},
+	} {
+		if trimmed := strings.TrimSpace(candidate.value); trimmed != "" {
+			return trimmed, false
+		}
+		if candidate.set {
+			blank = true
+		}
+	}
+	return "", blank
 }
 
 // warnIgnoredByLocal reports attributes the local backend has no use for. It
